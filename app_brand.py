@@ -29,30 +29,29 @@ XLSX_NAME = "올리브영_브랜드_순위.xlsx"
 OUTPUT_PATH = os.path.join(OUTPUT_DIR, XLSX_NAME)
 
 # Secrets (환경변수)
-SLACK_WEBHOOK_URL   = os.environ.get("SLACK_WEBHOOK_URL", "")
-GDRIVE_FOLDER_ID    = os.environ.get("GDRIVE_FOLDER_ID", "")
-GOOGLE_CLIENT_ID    = os.environ.get("GOOGLE_CLIENT_ID", "")
-GOOGLE_CLIENT_SECRET= os.environ.get("GOOGLE_CLIENT_SECRET", "")
-GOOGLE_REFRESH_TOKEN= os.environ.get("GOOGLE_REFRESH_TOKEN", "")
+SLACK_WEBHOOK_URL    = os.environ.get("SLACK_WEBHOOK_URL", "")
+GDRIVE_FOLDER_ID     = os.environ.get("GDRIVE_FOLDER_ID", "")
+GOOGLE_CLIENT_ID     = os.environ.get("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
+GOOGLE_REFRESH_TOKEN = os.environ.get("GOOGLE_REFRESH_TOKEN", "")
 
 # -------------------------
 # Playwright helpers
 # -------------------------
 async def maybe_click_brand_tab(page):
     """상단 탭에서 '브랜드 랭킹'을 확실히 선택"""
-    # 탭 전환(텍스트/role 버튼 등 여러 방식 시도)
     selectors = [
-        "text=브랜드 랭킹",                      # 일반 텍스트
-        "role=tab[name='브랜드 랭킹']",          # tab role
+        "role=tab[name='브랜드 랭킹']",
         "button:has-text('브랜드 랭킹')",
         "a:has-text('브랜드 랭킹')",
+        "text=브랜드 랭킹",
     ]
     for sel in selectors:
         try:
-            el = await page.wait_for_selector(sel, timeout=2000)
+            el = await page.wait_for_selector(sel, timeout=1500)
             if el:
-                await el.click(timeout=1000)
-                await page.wait_for_timeout(600)
+                await el.click(timeout=800)
+                await page.wait_for_timeout(500)
                 break
         except Exception:
             pass
@@ -65,89 +64,133 @@ async def close_banners(page):
         "[class*='btn_close']",
         "text=닫기",
         "text=취소",
-        "text=나중에"
+        "text=나중에",
     ]
     for sel in candidates:
         try:
             el = await page.query_selector(sel)
             if el:
-                await el.click(timeout=600)
-                await page.wait_for_timeout(200)
+                await el.click(timeout=500)
+                await page.wait_for_timeout(150)
         except Exception:
             pass
 
-async def scroll_to_bottom(page, pause_ms=800, max_loops=28):
+async def click_more_until_end(page, max_clicks=10):
+    """'더보기'류 버튼을 끝까지 클릭"""
+    texts = ["더보기", "더 보기", "more", "More"]
+    for _ in range(max_clicks):
+        clicked = False
+        for t in texts:
+            try:
+                btn = await page.query_selector(f"button:has-text('{t}'), a:has-text('{t}')")
+                if btn:
+                    await btn.click(timeout=800)
+                    await page.wait_for_timeout(700)
+                    clicked = True
+                    break
+            except Exception:
+                pass
+        if not clicked:
+            break
+
+async def scroll_to_bottom(page, pause_ms=900, max_loops=60):
     """무한 스크롤(브랜드 100위까지 로드)"""
     last_h = 0
     for _ in range(max_loops):
         try:
             h = await page.evaluate("document.body.scrollHeight")
-            if h == last_h:
-                break
             await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             await page.wait_for_timeout(pause_ms)
-            last_h = h
+            h2 = await page.evaluate("document.body.scrollHeight")
+            if h2 == last_h == h:
+                break
+            last_h = h2
         except Exception:
             break
 
-def _looks_like_brand(text: str) -> bool:
-    """브랜드 후보 필터: 너무 긴 문장/가격/프로모션/제품명 등 제거"""
-    if not text:
-        return False
-    t = text.strip()
-    if len(t) < 2 or len(t) > 30:
-        return False
-    # 제품에 흔한 토큰/단위/숫자/프로모션 단어 제거
-    ban = ["세일", "특가", "쿠폰", "기획", "세트", "증정", "구성", "마스크",
-           "패드", "크림", "토너", "세럼", "샴푸", "앰플", "ml", "g", "%", "원"]
-    if any(b in t for b in ban):
-        return False
-    if re.search(r"\d", t):  # 숫자 많이 포함하면 제외(랭킹번호/가격 등)
-        # 단, 브랜드명이 숫자만 있는 경우 제외
-        return False
-    # 설명성 긴 문장은 제외(공백 6단어 초과)
-    if len(t.split()) > 6:
-        return False
-    return True
+# -------------------------
+# 텍스트 정규화 & 필터
+# -------------------------
+BAN_SUBSTRINGS = [
+    "이미지", "썸네일", "로고", "타이틀", "아이콘", "배너", "상품", "클럽",
+    "랭킹", "판매", "온라인", "일간", "주간", "월간"
+]
+BAN_EXACT = {
+    "오늘드림", "올리브영", "헬스", "헬스플러스", "럭스에디트", "이벤트", "기획전"
+}
 
-async def extract_brands_robust(page):
-    """여러 구조를 동시에 시도하여 Top100 브랜드를 최대한 안정적으로 수집"""
-    brands = []
+def normalize_brand_text(t: str) -> str | None:
+    if not t:
+        return None
+    s = re.sub(r"\s+", " ", t).strip()
 
-    # 1) 명시적 클래스 후보에서 수집
-    brand_name_selectors = [
-        ".brand", ".brandName", ".tx_brand", ".brand-name",
-        "strong[class*='brand']", "span[class*='brand']", "em[class*='brand']",
-        ".tit", ".name", ".txt"  # 종종 '메디힐' 같은 한글이 여기 들어감
+    # 뒤에 붙는 꾸러미 단어 제거
+    s = re.sub(r"\s*(브랜드\s*썸네일|로고.*|이미지.*|타이틀.*)$", "", s).strip()
+
+    # 금지 정확어
+    if s in BAN_EXACT:
+        return None
+    # 금지 포함어
+    if any(x in s for x in BAN_SUBSTRINGS):
+        return None
+
+    # 너무 길거나 너무 짧은 건 제외
+    if len(s) < 1 or len(s) > 30:
+        return None
+
+    # 가격/수량 단위 등 제외
+    if re.search(r"(원|%|ml|g)\b", s, re.IGNORECASE):
+        return None
+
+    # 공백 6단어 초과 제외(설명성 텍스트)
+    if len(s.split()) > 6:
+        return None
+
+    # 지나치게 일반적인 단어 방지
+    if s.lower() in {"brand", "logo", "image", "title"}:
+        return None
+
+    return s
+
+async def extract_brands(page):
+    """여러 구조에서 후보를 모으고 정규화 후 Top100 반환"""
+    candidates: list[str] = []
+
+    # 1) 브랜드 전용/제목성 클래스
+    sel_groups = [
+        ".brand, .brandName, .tx_brand, .brand-name",
+        "strong[class*='brand'], span[class*='brand'], em[class*='brand']",
+        ".tit, .name, .txt, .title"
     ]
-    for sel in brand_name_selectors:
+    for sels in sel_groups:
         try:
-            nodes = await page.query_selector_all(sel)
+            nodes = await page.query_selector_all(sels)
             for n in nodes:
                 try:
                     t = (await n.inner_text()).strip()
-                    if _looks_like_brand(t):
-                        brands.append(t)
+                    nb = normalize_brand_text(t)
+                    if nb:
+                        candidates.append(nb)
                 except Exception:
                     pass
         except Exception:
             pass
 
-    # 2) 로고 img alt에서 수집 (영문 브랜드 로고가 alt에 많은 편)
+    # 2) 로고 alt에서 브랜드명 추정
     try:
         imgs = await page.query_selector_all("img[alt]")
         for im in imgs:
             try:
                 alt = (await im.get_attribute("alt")) or ""
-                alt = alt.strip()
-                if _looks_like_brand(alt):
-                    brands.append(alt)
+                nb = normalize_brand_text(alt)
+                if nb:
+                    candidates.append(nb)
             except Exception:
                 pass
     except Exception:
         pass
 
-    # 3) 리스트 아이템 텍스트 백업(구조가 바뀌었을 때)
+    # 3) 리스트 아이템 텍스트 백업
     try:
         items = await page.query_selector_all("ul li, ol li")
         for li in items:
@@ -155,12 +198,11 @@ async def extract_brands_robust(page):
                 raw = (await li.inner_text()).strip()
                 if not raw:
                     continue
-                # 줄 단위로 쪼개서 가장 '브랜드스러운' 후보 선택
-                lines = [re.sub(r"\s+", " ", s).strip() for s in raw.splitlines()]
-                for s in lines:
-                    s2 = re.sub(r"^[#\d\.\-\)\(]+", "", s).strip()
-                    if _looks_like_brand(s2):
-                        brands.append(s2)
+                for s in [re.sub(r"^[#\d\.\-\)\(]+", "", x).strip()
+                          for x in re.split(r"[\n\r]+", raw)]:
+                    nb = normalize_brand_text(s)
+                    if nb:
+                        candidates.append(nb)
                         break
             except Exception:
                 pass
@@ -168,12 +210,16 @@ async def extract_brands_robust(page):
         pass
 
     # 정리: 순서 유지 중복 제거
-    uniq = list(OrderedDict.fromkeys([b for b in brands if b]))
-    # 너무 일반/잡음 문자열 제거(페이지 공통 단어)
-    junk = {"브랜드", "랭킹", "판매", "온라인", "일간", "주간", "월간", "더보기"}
+    uniq = list(OrderedDict.fromkeys(candidates))
+
+    # 페이지 공통 잡단어 추가 제거
+    junk = {"더보기", "전체보기"}
     cleaned = [x for x in uniq if x not in junk]
     return cleaned[:100]
 
+# -------------------------
+# 크롤링 본체
+# -------------------------
 async def scrape_top100():
     async with async_playwright() as p:
         iphone = p.devices.get("iPhone 13 Pro")
@@ -182,16 +228,17 @@ async def scrape_top100():
         page = await context.new_page()
 
         await page.goto(URL, wait_until="domcontentloaded", timeout=60_000)
-        await page.wait_for_timeout(1200)
+        await page.wait_for_timeout(1000)
         await close_banners(page)
         await maybe_click_brand_tab(page)
-        await page.wait_for_timeout(800)
+        await page.wait_for_timeout(600)
 
-        await scroll_to_bottom(page, pause_ms=700, max_loops=30)
+        await click_more_until_end(page)
+        await scroll_to_bottom(page, pause_ms=900, max_loops=60)
 
-        brands = await extract_brands_robust(page)
+        brands = await extract_brands(page)
 
-        # 디버그 아웃풋 (100개 미만이면 HTML/스크린샷 저장)
+        # 디버그 아웃풋
         os.makedirs(OUTPUT_DIR, exist_ok=True)
         if len(brands) < 100:
             try:
@@ -338,18 +385,23 @@ def post_slack_top10(brands, ymap, now):
 # Google Drive 업로드
 # -------------------------
 def build_drive_service():
+    # NOTE: invalid_scope 방지를 위해 drive.file 스코프로 통일
     if not (GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and GOOGLE_REFRESH_TOKEN and GDRIVE_FOLDER_ID):
         print("[경고] 구글 드라이브 시크릿이 없어 업로드를 건너뜁니다.")
         return None
-    creds = Credentials(
-        token=None,
-        refresh_token=GOOGLE_REFRESH_TOKEN,
-        token_uri="https://oauth2.googleapis.com/token",
-        client_id=GOOGLE_CLIENT_ID,
-        client_secret=GOOGLE_CLIENT_SECRET,
-        scopes=["https://www.googleapis.com/auth/drive"]
-    )
-    return build("drive", "v3", credentials=creds)
+    try:
+        creds = Credentials(
+            token=None,
+            refresh_token=GOOGLE_REFRESH_TOKEN,
+            token_uri="https://oauth2.googleapis.com/token",
+            client_id=GOOGLE_CLIENT_ID,
+            client_secret=GOOGLE_CLIENT_SECRET,
+            scopes=["https://www.googleapis.com/auth/drive.file"],
+        )
+        return build("drive", "v3", credentials=creds)
+    except Exception as e:
+        print(f"[드라이브] 서비스 생성 실패: {e}")
+        return None
 
 def find_file_in_folder(service, folder_id, name):
     q = f"name = '{name}' and '{folder_id}' in parents and trashed = false"
@@ -361,22 +413,29 @@ def upload_or_update_to_drive(filepath, folder_id):
     service = build_drive_service()
     if not service:
         return
-    file_id = find_file_in_folder(service, folder_id, os.path.basename(filepath))
-    media = MediaFileUpload(filepath, mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", resumable=True)
-    if file_id:
-        service.files().update(fileId=file_id, media_body=media).execute()
-        print(f"[드라이브] 기존 파일 갱신 완료: {filepath}")
-    else:
-        file_metadata = {"name": os.path.basename(filepath), "parents": [folder_id]}
-        service.files().create(body=file_metadata, media_body=media, fields="id").execute()
-        print(f"[드라이브] 새 파일 업로드 완료: {filepath}")
+    try:
+        file_id = find_file_in_folder(service, folder_id, os.path.basename(filepath))
+        media = MediaFileUpload(
+            filepath,
+            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            resumable=True,
+        )
+        if file_id:
+            service.files().update(fileId=file_id, media_body=media).execute()
+            print(f"[드라이브] 기존 파일 갱신 완료: {filepath}")
+        else:
+            file_metadata = {"name": os.path.basename(filepath), "parents": [folder_id]}
+            service.files().create(body=file_metadata, media_body=media, fields="id").execute()
+            print(f"[드라이브] 새 파일 업로드 완료: {filepath}")
+    except Exception as e:
+        # 업로드 실패해도 파이프라인 실패시키지 않음
+        print(f"[드라이브] 업로드/갱신 실패: {e}")
 
 # -------------------------
 # main
 # -------------------------
 async def main():
     brands = await scrape_top100()
-    # 이전엔 실패 시 RuntimeError로 종료 → 이제는 경고만 출력하고 진행(디버그 파일 저장됨)
     if not brands:
         print("[경고] 브랜드 0개 수집 — 디버그 HTML/PNG 확인 필요")
     else:
