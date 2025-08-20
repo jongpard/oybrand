@@ -172,19 +172,27 @@ async def scroll_to_bottom(page, pause_ms=900, max_loops=60):
 # 네트워크(JSON) 기반 추출
 # -------------------------
 def extract_brands_from_json_objs(json_objs):
-    cand = []
+    """네트워크 JSON에서 '브랜드 랭킹'만 정확히 추출.
+       data[*].brandsInfo.brandName 만 수집하고 그 외는 무시."""
+    names = []
 
-    def walk(obj):
-        if isinstance(obj, dict):
-            for k, v in obj.items():
+    def walk(node):
+        if isinstance(node, dict):
+            # 가장 흔한 구조: {..., "brandsInfo": {"brandName": "메디힐", ...}, "goodsInfo": [...]}
+            bi = node.get("brandsInfo") or node.get("brandInfo")
+            if isinstance(bi, dict):
+                nm = (bi.get("brandName") or bi.get("brandNm") or
+                      bi.get("brandKrName") or bi.get("brand_kor_name"))
+                if isinstance(nm, str):
+                    nm = normalize_brand_text(nm)
+                    if nm:
+                        names.append(nm)
+            # 하위로 계속 탐색
+            for v in node.values():
                 if isinstance(v, (dict, list)):
                     walk(v)
-                elif isinstance(v, str) and is_brand_name_key(k):
-                    nb = normalize_brand_text(v)
-                    if nb:
-                        cand.append(nb)
-        elif isinstance(obj, list):
-            for it in obj:
+        elif isinstance(node, list):
+            for it in node:
                 walk(it)
 
     for jo in json_objs:
@@ -193,8 +201,8 @@ def extract_brands_from_json_objs(json_objs):
         except Exception:
             pass
 
-    uniq = list(OrderedDict.fromkeys(cand))
-    return uniq[:100]
+    # 순서 유지 중복 제거 (응답 순서를 랭킹으로 간주)
+    return list(OrderedDict.fromkeys(names))[:100]
 
 # -------------------------
 # DOM 보조 추출 (컨테이너 범위 제한)
