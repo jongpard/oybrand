@@ -22,7 +22,7 @@ from google.oauth2.credentials import Credentials
 # 설정
 # -------------------------
 KST = ZoneInfo("Asia/Seoul")
-URL = "https://m.oliveyoung.co.kr/m/mtn?menu=ranking&tab=brands&timeSaleDayFilter=today&toggle=OFF"
+URL = "https://m.oliveyoung.co.kr/m/mtn?menu=ranking&tab=brands"
 
 OUTPUT_DIR = "data"
 XLSX_NAME = "올리브영_브랜드_순위.xlsx"
@@ -36,17 +36,57 @@ GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
 GOOGLE_REFRESH_TOKEN = os.environ.get("GOOGLE_REFRESH_TOKEN", "")
 
 # -------------------------
+# 금지/정규화 규칙
+# -------------------------
+BAN_SUBSTRINGS = [
+    "이미지","썸네일","로고","타이틀","아이콘","배너","상품","클럽",
+    "랭킹","판매","온라인","일간","주간","월간","혜택","쿠폰","무료",
+    "무배","배송","오늘드림","오특","증정","기획","세트","이벤트","베스트","BEST"
+]
+BAN_EXACT = {
+    "오늘드림","올리브영","헬스","헬스플러스","럭스에디트","대표전화","고객센터",
+    "채팅 상담","사업자 정보 확인","1:문의","전체보기","더보기","더 보기"
+}
+
+def normalize_brand_text(t: str) -> str | None:
+    if not t:
+        return None
+    s = re.sub(r"\s+", " ", t).strip()
+
+    # 뒤꼬리 제거 (… 로고/이미지/타이틀/브랜드 썸네일 등)
+    s = re.sub(r"\s*(브랜드\s*썸네일|로고.*|이미지.*|타이틀.*)$", "", s).strip()
+
+    if s in BAN_EXACT:
+        return None
+    if any(x in s for x in BAN_SUBSTRINGS):
+        return None
+    if len(s) < 1 or len(s) > 30:
+        return None
+    if len(s.split()) > 6:
+        return None
+    # 가격/수량 단위 제거
+    if re.search(r"(원|%|ml|g)\b", s, re.IGNORECASE):
+        return None
+    # 지나치게 일반적인 영어 단어
+    if s.lower() in {"brand","logo","image","title"}:
+        return None
+    # 특수문자 과다/순수 숫자 제거
+    if re.fullmatch(r"[0-9\W_]+", s):
+        return None
+    return s
+
+# -------------------------
 # Playwright helpers
 # -------------------------
 async def maybe_click_brand_tab(page):
     """상단 탭에서 '브랜드 랭킹'을 확실히 선택"""
-    selectors = [
+    sels = [
         "role=tab[name='브랜드 랭킹']",
         "button:has-text('브랜드 랭킹')",
         "a:has-text('브랜드 랭킹')",
         "text=브랜드 랭킹",
     ]
-    for sel in selectors:
+    for sel in sels:
         try:
             el = await page.wait_for_selector(sel, timeout=1500)
             if el:
@@ -57,14 +97,9 @@ async def maybe_click_brand_tab(page):
             pass
 
 async def close_banners(page):
-    """앱유도/팝업 닫기(있을 때만)"""
     candidates = [
-        "[aria-label*='닫기']",
-        "button[aria-label*='닫기']",
-        "[class*='btn_close']",
-        "text=닫기",
-        "text=취소",
-        "text=나중에",
+        "[aria-label*='닫기']","button[aria-label*='닫기']","[class*='btn_close']",
+        "text=닫기","text=취소","text=나중에",
     ]
     for sel in candidates:
         try:
@@ -75,9 +110,8 @@ async def close_banners(page):
         except Exception:
             pass
 
-async def click_more_until_end(page, max_clicks=10):
-    """'더보기'류 버튼을 끝까지 클릭"""
-    texts = ["더보기", "더 보기", "more", "More"]
+async def click_more_until_end(page, max_clicks=12):
+    texts = ["더보기","더 보기","More","more"]
     for _ in range(max_clicks):
         clicked = False
         for t in texts:
@@ -94,7 +128,6 @@ async def click_more_until_end(page, max_clicks=10):
             break
 
 async def scroll_to_bottom(page, pause_ms=900, max_loops=60):
-    """무한 스크롤(브랜드 100위까지 로드)"""
     last_h = 0
     for _ in range(max_loops):
         try:
@@ -109,123 +142,128 @@ async def scroll_to_bottom(page, pause_ms=900, max_loops=60):
             break
 
 # -------------------------
-# 텍스트 정규화 & 필터
+# 네트워크(JSON) 기반 추출
 # -------------------------
-BAN_SUBSTRINGS = [
-    "이미지", "썸네일", "로고", "타이틀", "아이콘", "배너", "상품", "클럽",
-    "랭킹", "판매", "온라인", "일간", "주간", "월간"
-]
-BAN_EXACT = {
-    "오늘드림", "올리브영", "헬스", "헬스플러스", "럭스에디트", "이벤트", "기획전"
-}
+def extract_brands_from_json_objs(json_objs):
+    cand = []
+    def walk(obj, parent_key=""):
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                kl = str(k).lower()
+                if isinstance(v, str):
+                    # 키에 brand 포함되면 강하게 후보로
+                    if "brand" in kl or "brnd" in kl:
+                        nb = normalize_brand_text(v)
+                        if nb:
+                            cand.append(nb)
+                else:
+                    walk(v, kl)
+        elif isinstance(obj, list):
+            for it in obj:
+                walk(it, parent_key)
 
-def normalize_brand_text(t: str) -> str | None:
-    if not t:
-        return None
-    s = re.sub(r"\s+", " ", t).strip()
-
-    # 뒤에 붙는 꾸러미 단어 제거
-    s = re.sub(r"\s*(브랜드\s*썸네일|로고.*|이미지.*|타이틀.*)$", "", s).strip()
-
-    # 금지 정확어
-    if s in BAN_EXACT:
-        return None
-    # 금지 포함어
-    if any(x in s for x in BAN_SUBSTRINGS):
-        return None
-
-    # 너무 길거나 너무 짧은 건 제외
-    if len(s) < 1 or len(s) > 30:
-        return None
-
-    # 가격/수량 단위 등 제외
-    if re.search(r"(원|%|ml|g)\b", s, re.IGNORECASE):
-        return None
-
-    # 공백 6단어 초과 제외(설명성 텍스트)
-    if len(s.split()) > 6:
-        return None
-
-    # 지나치게 일반적인 단어 방지
-    if s.lower() in {"brand", "logo", "image", "title"}:
-        return None
-
-    return s
-
-async def extract_brands(page):
-    """여러 구조에서 후보를 모으고 정규화 후 Top100 반환"""
-    candidates: list[str] = []
-
-    # 1) 브랜드 전용/제목성 클래스
-    sel_groups = [
-        ".brand, .brandName, .tx_brand, .brand-name",
-        "strong[class*='brand'], span[class*='brand'], em[class*='brand']",
-        ".tit, .name, .txt, .title"
-    ]
-    for sels in sel_groups:
+    for jo in json_objs:
         try:
-            nodes = await page.query_selector_all(sels)
-            for n in nodes:
-                try:
-                    t = (await n.inner_text()).strip()
-                    nb = normalize_brand_text(t)
-                    if nb:
-                        candidates.append(nb)
-                except Exception:
-                    pass
+            walk(jo)
         except Exception:
             pass
+    uniq = list(OrderedDict.fromkeys(cand))
+    # 추가 노이즈 컷
+    junk = {"브랜드","랭킹","판매","온라인"}
+    return [x for x in uniq if x not in junk][:100]
 
-    # 2) 로고 alt에서 브랜드명 추정
-    try:
-        imgs = await page.query_selector_all("img[alt]")
-        for im in imgs:
-            try:
-                alt = (await im.get_attribute("alt")) or ""
-                nb = normalize_brand_text(alt)
-                if nb:
-                    candidates.append(nb)
-            except Exception:
-                pass
-    except Exception:
-        pass
+# -------------------------
+# DOM 보조 추출 (브랜드 목록 영역만 스코프)
+# -------------------------
+BRAND_CONTAINER_CANDIDATES = [
+    "[id*='brand'][class*='list']", "[class*='brand'][class*='list']",
+    "[class*='brand'][class*='wrap']", "[class*='brand'][class*='container']",
+    "#contents, #container, main"
+]
+BRAND_NAME_CANDIDATE_SELECTORS = [
+    ".brand, .brandName, .tx_brand, .brand-name, .tit, .name, .txt, .title",
+    "strong[class*='brand'], span[class*='brand'], em[class*='brand']"
+]
 
-    # 3) 리스트 아이템 텍스트 백업
-    try:
-        items = await page.query_selector_all("ul li, ol li")
-        for li in items:
+async def extract_brands_from_dom(page):
+    # 가능한 컨테이너를 좁혀서 그 안에서만 텍스트 추출
+    brands = []
+    for cont_sel in BRAND_CONTAINER_CANDIDATES:
+        try:
+            containers = await page.query_selector_all(cont_sel)
+        except Exception:
+            containers = []
+        for c in containers:
             try:
-                raw = (await li.inner_text()).strip()
-                if not raw:
+                html = (await c.inner_html()) or ""
+                # 랭킹 영역으로 보이는 컨테이너만 (일간/브랜드/순위 숫자 포함)
+                if not re.search(r"(브랜드|랭킹).*(일간|주간|월간)|\b1\b", html):
                     continue
-                for s in [re.sub(r"^[#\d\.\-\)\(]+", "", x).strip()
-                          for x in re.split(r"[\n\r]+", raw)]:
-                    nb = normalize_brand_text(s)
-                    if nb:
-                        candidates.append(nb)
-                        break
             except Exception:
                 pass
-    except Exception:
-        pass
 
-    # 정리: 순서 유지 중복 제거
-    uniq = list(OrderedDict.fromkeys(candidates))
+            for sels in BRAND_NAME_CANDIDATE_SELECTORS:
+                try:
+                    nodes = await c.query_selector_all(sels)
+                    for n in nodes:
+                        try:
+                            t = (await n.inner_text()).strip()
+                            nb = normalize_brand_text(t)
+                            if nb:
+                                brands.append(nb)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
 
-    # 페이지 공통 잡단어 추가 제거
-    junk = {"더보기", "전체보기"}
-    cleaned = [x for x in uniq if x not in junk]
-    return cleaned[:100]
+            # 로고 alt
+            try:
+                imgs = await c.query_selector_all("img[alt]")
+                for im in imgs:
+                    try:
+                        alt = (await im.get_attribute("alt")) or ""
+                        nb = normalize_brand_text(alt)
+                        if nb:
+                            brands.append(nb)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+    uniq = list(OrderedDict.fromkeys(brands))
+    junk = {"브랜드","랭킹","판매","온라인","일간","주간","월간"}
+    return [x for x in uniq if x not in junk][:100]
 
 # -------------------------
 # 크롤링 본체
 # -------------------------
 async def scrape_top100():
+    json_payloads = []
+
     async with async_playwright() as p:
         iphone = p.devices.get("iPhone 13 Pro")
         browser = await p.chromium.launch(headless=True)
         context = await browser.new_context(**iphone, locale="ko-KR")
+
         page = await context.new_page()
+
+        # 네트워크 응답 수집 (brand/rank/best 키워드 우선)
+        def _want(url: str) -> bool:
+            u = url.lower()
+            return ("brand" in u or "ranking" in u or "best" in u) and ("oliveyoung" in u or u.startswith("https://"))
+        page.on("response", lambda resp: None)  # placeholder for type
+        async def on_response(resp):
+            try:
+                url = resp.url
+                if not _want(url):
+                    return
+                ctype = resp.headers.get("content-type","").lower()
+                if "application/json" in ctype:
+                    jo = await resp.json()
+                    json_payloads.append(jo)
+            except Exception:
+                pass
+        page.on("response", lambda r: asyncio.create_task(on_response(r)))
 
         await page.goto(URL, wait_until="domcontentloaded", timeout=60_000)
         await page.wait_for_timeout(1000)
@@ -235,24 +273,26 @@ async def scrape_top100():
 
         await click_more_until_end(page)
         await scroll_to_bottom(page, pause_ms=900, max_loops=60)
+        await page.wait_for_timeout(1000)  # 네트워크 여유
 
-        brands = await extract_brands(page)
+        brands = extract_brands_from_json_objs(json_payloads)
+
+        if len(brands) < 10:
+            # JSON에서 충분치 않으면 DOM 백업 사용
+            brands = await extract_brands_from_dom(page)
 
         # 디버그 아웃풋
         os.makedirs(OUTPUT_DIR, exist_ok=True)
-        if len(brands) < 100:
-            try:
-                await page.screenshot(path=os.path.join(OUTPUT_DIR, "brand_debug.png"), full_page=True)
-                html = await page.content()
-                with open(os.path.join(OUTPUT_DIR, "brand_debug.html"), "w", encoding="utf-8") as f:
-                    f.write(html)
-                print(f"[디버그] brand_debug.* 저장 (추출 {len(brands)}개)")
-            except Exception as e:
-                print(f"[디버그 저장 실패] {e}")
+        try:
+            await page.screenshot(path=os.path.join(OUTPUT_DIR, "brand_debug.png"), full_page=True)
+            with open(os.path.join(OUTPUT_DIR, "brand_debug.json"), "w", encoding="utf-8") as f:
+                json.dump(json_payloads[:2], f, ensure_ascii=False, indent=2)  # 일부만 저장
+        except Exception:
+            pass
 
         await context.close()
         await browser.close()
-        return brands
+        return brands[:100]
 
 # -------------------------
 # 엑셀: 월 시트 자동 생성/갱신
@@ -282,7 +322,7 @@ def setup_layout(ws, dt: datetime):
     ws["A3"] = "요일"
     for d in range(1, last_day + 1):
         wd = date(dt.year, dt.month, d).weekday()
-        ws.cell(row=3, column=1 + d).value = ["월", "화", "수", "목", "금", "토", "일"][wd]
+        ws.cell(row=3, column=1 + d).value = ["월","화","수","목","금","토","일"][wd]
 
     ws["A4"] = "비고"
     for r in range(1, 101):
@@ -382,10 +422,9 @@ def post_slack_top10(brands, ymap, now):
         print(f"[슬랙] 전송 실패: {e}")
 
 # -------------------------
-# Google Drive 업로드
+# Google Drive 업로드 (drive.file 스코프)
 # -------------------------
 def build_drive_service():
-    # NOTE: invalid_scope 방지를 위해 drive.file 스코프로 통일
     if not (GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and GOOGLE_REFRESH_TOKEN and GDRIVE_FOLDER_ID):
         print("[경고] 구글 드라이브 시크릿이 없어 업로드를 건너뜁니다.")
         return None
@@ -428,7 +467,6 @@ def upload_or_update_to_drive(filepath, folder_id):
             service.files().create(body=file_metadata, media_body=media, fields="id").execute()
             print(f"[드라이브] 새 파일 업로드 완료: {filepath}")
     except Exception as e:
-        # 업로드 실패해도 파이프라인 실패시키지 않음
         print(f"[드라이브] 업로드/갱신 실패: {e}")
 
 # -------------------------
@@ -437,7 +475,7 @@ def upload_or_update_to_drive(filepath, folder_id):
 async def main():
     brands = await scrape_top100()
     if not brands:
-        print("[경고] 브랜드 0개 수집 — 디버그 HTML/PNG 확인 필요")
+        print("[경고] 브랜드 0개 수집 — 디버그 파일 확인 필요")
     else:
         print(f"[INFO] 브랜드 {len(brands)}개 수집")
 
