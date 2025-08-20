@@ -22,7 +22,7 @@ from google.oauth2.credentials import Credentials
 # 설정
 # -------------------------
 KST = ZoneInfo("Asia/Seoul")
-URL = "https://m.oliveyoung.co.kr/m/mtn?menu=ranking&tab=brands"
+URL = "https://m.oliveyoung.co.kr/m/mtn?menu=ranking&tab=brands&timeSaleDayFilter=today&toggle=OFF"
 
 OUTPUT_DIR = "data"
 XLSX_NAME = "올리브영_브랜드_순위.xlsx"
