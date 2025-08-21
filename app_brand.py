@@ -1,4 +1,6 @@
 # app_brand.py
+# -*- coding: utf-8 -*-
+
 import asyncio
 import os
 import re
@@ -7,6 +9,7 @@ from datetime import datetime, timedelta, date
 from zoneinfo import ZoneInfo
 from calendar import monthrange
 from collections import OrderedDict
+from urllib.parse import urlparse
 
 import requests
 from openpyxl import Workbook, load_workbook
@@ -36,8 +39,12 @@ GOOGLE_CLIENT_ID     = os.environ.get("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
 GOOGLE_REFRESH_TOKEN = os.environ.get("GOOGLE_REFRESH_TOKEN", "")
 
+# Cloudflare 우회(옵션)
+PROXY_SERVER         = os.environ.get("PROXY_SERVER", "")      # 예: http://user:pass@host:port
+CF_CLEARANCE         = os.environ.get("CF_CLEARANCE", "")      # m.oliveyoung.co.kr 의 cf_clearance 값
+
 # -------------------------
-# 텍스트 정규화(코드/숫자 제거만 최소 적용)
+# 유틸/정규화
 # -------------------------
 CODE_PATTERNS = [
     re.compile(r"^[A-Z]\d{4,}$"),  # A000688 등
@@ -45,12 +52,13 @@ CODE_PATTERNS = [
 ]
 
 def normalize_brand_text(t: str) -> str | None:
+    """브랜드명 후보 텍스트 정규화(숫자/코드/꼬리표 제거, 길이 제한 등)"""
     if not isinstance(t, str):
         return None
     s = re.sub(r"\s+", " ", t).strip()
     if not s:
         return None
-    # 흔한 꼬리표 제거
+    # 자주 붙는 꼬리표 컷
     s = re.sub(r"\s*(브랜드\s*썸네일|로고.*|이미지.*|타이틀.*)$", "", s).strip()
     # 코드/숫자 포함 컷
     for p in CODE_PATTERNS:
@@ -58,16 +66,30 @@ def normalize_brand_text(t: str) -> str | None:
             return None
     if re.search(r"\d", s):
         return None
-    # 길이 제한(브랜드명은 보통 짧음)
-    if len(s) > 30:
+    # 길이/단어수 제한
+    if len(s) > 30 or len(s.split()) > 6:
         return None
-    # 1글자는 한글만 허용(‘려’ 같은 케이스)
+    # 1글자는 한글만 허용(‘려’ 등)
     if len(s) == 1 and not re.fullmatch(r"[가-힣]", s):
         return None
-    # 너무 일반적인 영어 단어 컷
-    if s.lower() in {"brand","logo","image","title"}:
+    # 너무 일반적인 영단어 컷
+    if s.lower() in {"brand", "logo", "image", "title"}:
         return None
     return s
+
+def parse_proxy(proxy_url: str) -> dict | None:
+    """Playwright proxy dict로 변환"""
+    if not proxy_url:
+        return None
+    u = urlparse(proxy_url)
+    if not (u.scheme and u.hostname and u.port):
+        return None
+    proxy = {"server": f"{u.scheme}://{u.hostname}:{u.port}"}
+    if u.username:
+        proxy["username"] = u.username
+    if u.password:
+        proxy["password"] = u.password
+    return proxy
 
 # -------------------------
 # Playwright helpers
@@ -106,13 +128,11 @@ async def close_banners(page):
             pass
 
 async def switch_to_brand_only_list(page):
-    """오른쪽 동그란 '리스트 보기' 버튼 자동 클릭 시도"""
+    """오른쪽 동그란 '리스트 보기' 버튼 자동 클릭 시도(브랜드명만 크게 보이는 뷰)"""
     sels = [
-        "button[aria-label*='리스트']",
-        "button[aria-label*='목록']",
-        "button[title*='리스트']",
-        ".btn_list", ".btnList", ".ico_list", ".type_list", ".view_list",
-        "button:has-text('리스트')",
+        "button[aria-label*='리스트']", "button[aria-label*='목록']",
+        "button[title*='리스트']", ".btn_list", ".btnList", ".ico_list",
+        ".type_list", ".view_list", "button:has-text('리스트')"
     ]
     for sel in sels:
         try:
@@ -123,7 +143,7 @@ async def switch_to_brand_only_list(page):
                 return True
         except Exception:
             pass
-    # '일간' 근처에 있는 토글 버튼을 마지막 수단으로 클릭
+    # '일간' 텍스트 주변 버튼 클릭(마지막 수단)
     try:
         tg = page.locator("text=일간").first
         if await tg.count() > 0:
@@ -139,7 +159,7 @@ async def switch_to_brand_only_list(page):
     return False
 
 async def click_more_until_end(page, max_clicks=12):
-    texts = ["더보기","더 보기","More","more"]
+    texts = ["더보기", "더 보기", "More", "more"]
     for _ in range(max_clicks):
         clicked = False
         for t in texts:
@@ -169,42 +189,58 @@ async def scroll_to_bottom(page, pause_ms=900, max_loops=60):
         except Exception:
             break
 
+def is_cf_block_html(html: str) -> bool:
+    if not html:
+        return False
+    return ("사람인지 확인" in html) or ("Cloudflare" in html and "확인" in html)
+
 # -------------------------
 # JSON(네트워크 응답)에서 브랜드명만 추출
 # -------------------------
 def extract_brands_from_json_objs(json_objs):
     """응답의 data[*].brandsInfo.brandName만 모아서 순서대로 반환"""
     names = []
+
+    def walk(node):
+        if isinstance(node, dict):
+            # 대표 구조: { ..., "brandsInfo": {"brandName": "메디힐", ...}, "goodsInfo": [...] }
+            bi = node.get("brandsInfo") or node.get("brandInfo")
+            if isinstance(bi, dict):
+                nm = (
+                    bi.get("brandName") or bi.get("brandNm")
+                    or bi.get("brandKrName") or bi.get("brand_kor_name")
+                )
+                nm = normalize_brand_text(nm)
+                if nm:
+                    names.append(nm)
+            for v in node.values():
+                if isinstance(v, (dict, list)):
+                    walk(v)
+        elif isinstance(node, list):
+            for it in node:
+                walk(it)
+
     for jo in json_objs:
         try:
+            # 우선 data 루트에 있으면 빠르게 긁고
             data = jo.get("data")
             if isinstance(data, list):
                 for item in data:
                     bi = item.get("brandsInfo") or item.get("brandInfo")
                     if isinstance(bi, dict):
-                        nm = (bi.get("brandName") or bi.get("brandNm") or
-                              bi.get("brandKrName") or bi.get("brand_kor_name"))
+                        nm = (
+                            bi.get("brandName") or bi.get("brandNm")
+                            or bi.get("brandKrName") or bi.get("brand_kor_name")
+                        )
                         nm = normalize_brand_text(nm)
                         if nm:
                             names.append(nm)
-            # 혹시 다른 구조가 섞여 오면 재귀로 보조
-            def walk(node):
-                if isinstance(node, dict):
-                    if "brandsInfo" in node and isinstance(node["brandsInfo"], dict):
-                        nm2 = normalize_brand_text(node["brandsInfo"].get("brandName"))
-                        if nm2:
-                            names.append(nm2)
-                    for v in node.values():
-                        if isinstance(v, (dict, list)):
-                            walk(v)
-                elif isinstance(node, list):
-                    for it in node:
-                        walk(it)
+            # 전체 탐색
             walk(jo)
         except Exception:
             pass
-    # 순서 유지 중복 제거 (응답 순서가 곧 랭킹)
-    return list(OrderedDict.fromkeys(names))[:100]
+
+    return list(OrderedDict.fromkeys(names))[:100]  # 순서 유지 중복 제거
 
 # -------------------------
 # DOM 보조 추출(혹시 JSON이 부족할 때만)
@@ -213,11 +249,11 @@ BRAND_CONTAINER_CANDIDATES = [
     "[class*='brand'][class*='list']",
     "[class*='brand'][class*='wrap']",
     "[class*='brand'][class*='container']",
-    "#contents, #container, main"
+    "#contents, #container, main",
 ]
 BRAND_NAME_CANDIDATE_SELECTORS = [
     ".brand, .brandName, .tx_brand, .brand-name, .tit, .name, .txt, .title",
-    "strong[class*='brand'], span[class*='brand'], em[class*='brand']"
+    "strong[class*='brand'], span[class*='brand'], em[class*='brand']",
 ]
 
 async def extract_brands_from_dom(page):
@@ -261,17 +297,39 @@ async def extract_brands_from_dom(page):
 # -------------------------
 async def scrape_top100():
     json_payloads = []
+    proxy = parse_proxy(PROXY_SERVER)
+
     async with async_playwright() as p:
+        # 모바일 에뮬레이션 + 프록시
         iphone = p.devices.get("iPhone 13 Pro")
-        browser = await p.chromium.launch(headless=True)
+        browser = await p.chromium.launch(
+            headless=True,
+            proxy=proxy  # None이면 무시
+        )
         context = await browser.new_context(**iphone, locale="ko-KR")
+
+        # cf_clearance 쿠키 주입(옵션)
+        if CF_CLEARANCE:
+            try:
+                await context.add_cookies([{
+                    "name": "cf_clearance",
+                    "value": CF_CLEARANCE,
+                    "domain": ".oliveyoung.co.kr",
+                    "path": "/",
+                    "secure": True,
+                    "httpOnly": False,
+                }])
+                print("[CF] cf_clearance 쿠키 주입 완료")
+            except Exception as e:
+                print(f"[CF] 쿠키 주입 실패: {e}")
+
         page = await context.new_page()
 
         # 브랜드 랭킹 JSON 캡처
         async def on_response(resp):
             try:
                 url = resp.url.lower()
-                ctype = resp.headers.get("content-type","").lower()
+                ctype = resp.headers.get("content-type", "").lower()
                 if ("brand" in url or "ranking" in url or "best" in url) and "application/json" in ctype:
                     jo = await resp.json()
                     json_payloads.append(jo)
@@ -285,20 +343,26 @@ async def scrape_top100():
         await maybe_click_brand_tab(page)
         await page.wait_for_timeout(400)
 
-        # ▶ 리스트 보기(브랜드명만) 전환 시도
+        # 리스트 보기 전환(브랜드명만 크게)
         await switch_to_brand_only_list(page)
 
         await click_more_until_end(page)
         await scroll_to_bottom(page, pause_ms=900, max_loops=60)
         await page.wait_for_timeout(800)
 
+        # 차단 감지
+        html = await page.content()
+        if is_cf_block_html(html):
+            print("[경고] Cloudflare 차단 페이지 감지 — 프록시/쿠키 확인 필요")
+
         brands = extract_brands_from_json_objs(json_payloads)
-        # JSON이 충분치 않으면 DOM 백업 사용
+
+        # JSON이 부족하면 DOM 백업 결합(순서 유지)
         if len(brands) < 50:
             dom_brands = await extract_brands_from_dom(page)
             brands = list(OrderedDict.fromkeys(brands + dom_brands))[:100]
 
-        # 디버그 저장(Artifacts로 올리려면 워크플로에서 data/brand_debug.* 업로드)
+        # 디버그 저장(Artifacts로 올리려면 워크플로에서 업로드)
         os.makedirs(OUTPUT_DIR, exist_ok=True)
         try:
             await page.screenshot(path=os.path.join(OUTPUT_DIR, "brand_debug.png"), full_page=True)
@@ -415,6 +479,10 @@ def post_slack_top10(brands, ymap, now):
     if not SLACK_WEBHOOK_URL:
         print("[경고] SLACK_WEBHOOK_URL 미설정 — 슬랙 전송 생략")
         return
+    if not brands:
+        print("[슬랙] 수집 결과 0개 — 전송 생략")
+        return
+
     top10 = brands[:10]
     lines = []
     for idx, name in enumerate(top10, start=1):
@@ -439,7 +507,7 @@ def post_slack_top10(brands, ymap, now):
         print(f"[슬랙] 전송 실패: {e}")
 
 # -------------------------
-# 구글 드라이브 업로드 (drive.file 스코프)
+# 구글 드라이브 업로드 (drive.file 스코프, 실패해도 파이프라인 유지)
 # -------------------------
 def build_drive_service():
     if not (GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and GOOGLE_REFRESH_TOKEN and GDRIVE_FOLDER_ID):
@@ -492,7 +560,7 @@ def upload_or_update_to_drive(filepath, folder_id):
 async def main():
     brands = await scrape_top100()
     if not brands:
-        print("[경고] 브랜드 0개 수집 — 디버그 파일 확인 필요")
+        print("[경고] 브랜드 0개 수집 — 프록시/쿠키 또는 차단 상태 확인 필요")
     else:
         print(f"[INFO] 브랜드 {len(brands)}개 수집")
 
