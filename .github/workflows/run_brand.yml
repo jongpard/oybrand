@@ -8,8 +8,7 @@ on:
 
 jobs:
   run:
-    runs-on: ubuntu-latest
-
+    runs-on: [self-hosted, kr]   # <= 네가 붙인 라벨과 맞춰줘
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -33,11 +32,13 @@ jobs:
           GOOGLE_CLIENT_ID:   ${{ secrets.GOOGLE_CLIENT_ID }}
           GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
           GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+          # 프록시/쿠키는 셀프호스트에선 보통 불필요하니 비움
+          PROXY_SERVER: ""
+          CF_CLEARANCE: ""
         run: |
           mkdir -p data
           python app_brand.py
 
-      # 결과 엑셀 업로드 (항상 업로드 시도)
       - name: Upload xlsx artifact
         if: always()
         uses: actions/upload-artifact@v4
@@ -46,7 +47,6 @@ jobs:
           path: data/올리브영_브랜드_순위.xlsx
           if-no-files-found: warn
 
-      # 디버그 파일(스크린샷/HTML/JSON)도 함께 업로드해서 문제 추적 가능
       - name: Upload debug artifacts
         if: always()
         uses: actions/upload-artifact@v4
