@@ -8,7 +8,8 @@ on:
 
 jobs:
   run:
-    runs-on: [self-hosted, kr]   # <= 네가 붙인 라벨과 맞춰줘
+    runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -27,14 +28,20 @@ jobs:
 
       - name: Run brand crawler
         env:
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-          GDRIVE_FOLDER_ID:   ${{ secrets.GDRIVE_FOLDER_ID }}
-          GOOGLE_CLIENT_ID:   ${{ secrets.GOOGLE_CLIENT_ID }}
+          # 필수/선택 시크릿
+          SLACK_WEBHOOK_URL:   ${{ secrets.SLACK_WEBHOOK_URL }}
+          GDRIVE_FOLDER_ID:    ${{ secrets.GDRIVE_FOLDER_ID }}
+          GOOGLE_CLIENT_ID:    ${{ secrets.GOOGLE_CLIENT_ID }}
           GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
           GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
-          # 프록시/쿠키는 셀프호스트에선 보통 불필요하니 비움
-          PROXY_SERVER: ""
-          CF_CLEARANCE: ""
+
+          # 스크래핑 API (무료/체험 크레딧 사용)
+          SCRAPING_API:        ${{ secrets.SCRAPING_API }}        # 예: scraperapi 또는 zenrows
+          SCRAPING_API_KEY:    ${{ secrets.SCRAPING_API_KEY }}
+
+          # (옵션) 클라우드플레어 대비 - 보통은 비워둠
+          PROXY_SERVER:        ${{ secrets.PROXY_SERVER }}
+          CF_CLEARANCE:        ${{ secrets.CF_CLEARANCE }}
         run: |
           mkdir -p data
           python app_brand.py
@@ -54,6 +61,6 @@ jobs:
           name: brand_debug
           path: |
             data/brand_debug.png
-            data/brand_debug.html
             data/brand_debug.json
+            data/brand_debug.html
           if-no-files-found: ignore
