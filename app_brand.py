@@ -208,14 +208,15 @@ async def scrape_top100():
 
         # WUB 힌트 헤더 추가
         context = await browser.new_context(
-            **iphone,
-            locale="ko-KR",
-            extra_http_headers={
-                "X-Oxylabs-Geo-Location": "South Korea",
-                "X-Oxylabs-Render": "html",
-                "X-Oxylabs-Device-Type": "mobile",
-            },
-        )
+    ignore_https_errors=True,      # ← 추가: 프록시 체인 인증서 오류 무시
+    **iphone,
+    locale="ko-KR",
+    extra_http_headers={
+        "X-Oxylabs-Geo-Location": "South Korea",
+        "X-Oxylabs-Render": "html",
+        "X-Oxylabs-Device-Type": "mobile",
+    },
+)
 
         # (선택) cf_clearance 쿠키 주입
         if CF_CLEARANCE:
