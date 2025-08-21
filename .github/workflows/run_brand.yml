@@ -7,58 +7,45 @@ on:
   workflow_dispatch:
 
 jobs:
-  run:
-    runs-on: ubuntu-latest
+  build-and-run:
+    runs-on: ubuntu-latest # 실행 환경
 
     steps:
-      - name: Checkout
+      # 1. 저장소 코드 가져오기
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      # 2. 파이썬 환경 설정
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
+          python-version: '3.11' # 파이썬 버전 지정
 
+      # 3. 파이썬 라이브러리 설치
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install playwright==1.45.0 openpyxl requests \
-            google-api-python-client google-auth google-auth-httplib2 google-auth-oauthlib
-          python -m playwright install --with-deps chromium
+          pip install requests beautifulsoup4 google-api-python-client google-auth-httplib2 google-auth-oauthlib playwright
 
-      - name: Run brand crawler via Web Unblocker proxy
+      # 4. Playwright 브라우저 설치 (HTTP 크롤링 실패 시 fallback을 위함)
+      - name: Install Playwright Browsers
+        run: playwright install --with-deps chromium
+
+      # 5. 브랜드 랭킹 크롤러 스크립트 실행
+      - name: Run Brand Ranking Crawler
+        # GitHub Secrets에 저장된 값들을 환경 변수로 설정하여 스크립트에 전달
         env:
-          # 필수: WUB 프록시 (예) http://customer-USER-cc-KR-sessid-oy123:PASSWORD@unblock.oxylabs.io:60000
-          PROXY_SERVER:        ${{ secrets.PROXY_SERVER }}
-
-          # 선택: 슬랙/드라이브
-          SLACK_WEBHOOK_URL:   ${{ secrets.SLACK_WEBHOOK_URL }}
-          GDRIVE_FOLDER_ID:    ${{ secrets.GDRIVE_FOLDER_ID }}
-          GOOGLE_CLIENT_ID:    ${{ secrets.GOOGLE_CLIENT_ID }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
           GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
           GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+        run: python brand_rank_app.py
 
-          # (옵션) cf_clearance 쿠키가 있다면 주입
-          CF_CLEARANCE:        ${{ secrets.CF_CLEARANCE }}
-        run: |
-          mkdir -p data
-          python app_brand.py
-
-      - name: Upload xlsx artifact
-        if: always()
+      # 6. (선택사항) 생성된 CSV 파일을 아티팩트로 업로드 (디버깅 및 백업용)
+      - name: Upload ranking data artifact
+        if: always() # 스크립트 성공/실패 여부와 관계없이 항상 실행
         uses: actions/upload-artifact@v4
         with:
-          name: oliveyoung_brand_xlsx
-          path: data/올리브영_브랜드_순위.xlsx
-          if-no-files-found: warn
-
-      - name: Upload debug artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: brand_debug
-          path: |
-            data/brand_debug.html
-            data/brand_debug.png
-            data/brand_debug.json
-          if-no-files-found: ignore
+          name: brand-ranking-csv
+          path: rankings/ # rankings 폴더 안의 모든 파일을 업로드
