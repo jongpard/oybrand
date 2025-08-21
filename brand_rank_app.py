@@ -17,7 +17,7 @@ from bs4 import BeautifulSoup
 # Playwright & Stealth
 try:
     from playwright.sync_api import sync_playwright
-    from playwright_stealth import stealth_sync # ✨ Stealth 라이브러리 import
+    from playwright_stealth import stealth_sync
     PLAYWRIGHT_AVAILABLE = True
 except Exception:
     PLAYWRIGHT_AVAILABLE = False
@@ -42,7 +42,7 @@ SCREENSHOT_PATH = "debug_screenshot.png"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 
-# ... (유틸, 파싱 함수는 이전과 동일) ...
+# ---------------- 유틸
 def kst_now():
     return datetime.now(timezone.utc) + timedelta(hours=9)
 
@@ -51,17 +51,20 @@ def make_session():
     retries = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
     s.mount("https://", HTTPAdapter(max_retries=retries))
     s.headers.update({
-        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1",
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17_5 Mobile/15E148 Safari/604.1",
         "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
         "Referer": "https://m.oliveyoung.co.kr/m/main.do",
     })
     return s
 
+# ---------------- 파싱/정제
 def parse_brand_html(html: str):
     soup = BeautifulSoup(html, "html.parser")
     list_items = soup.select("div.rank_brand_list > ul > li")
     results = []
-    if not list_items: return []
+    if not list_items:
+        logging.warning("브랜드 랭킹 리스트(.rank_brand_list > ul > li)를 찾을 수 없습니다.")
+        return []
     for item in list_items[:MAX_ITEMS]:
         rank_node = item.select_one(".rank_num"); rank = int(rank_node.get_text(strip=True)) if rank_node else None
         brand_name_node = item.select_one(".brand_name"); brand_name = brand_name_node.get_text(strip=True) if brand_name_node else ""
@@ -73,7 +76,7 @@ def parse_brand_html(html: str):
     logging.info("parse_brand_html: %d개의 브랜드 순위를 파싱했습니다.", len(results))
     return results
 
-def fetch_brand_ranking_data(): # 이 함수는 이제 거의 항상 실패하지만, 만일을 위해 남겨둡니다.
+def fetch_brand_ranking_data():
     session = make_session()
     url = "https://m.oliveyoung.co.kr/m/mtn/ranking/getBrandRanking.do"
     try:
@@ -84,7 +87,6 @@ def fetch_brand_ranking_data(): # 이 함수는 이제 거의 항상 실패하�
     except Exception:
         return None, "HTTP Request Exception"
 
-# --- ✨ Stealth 모드가 적용된 Playwright 함수 ---
 def try_playwright_for_brands_stealth():
     if not PLAYWRIGHT_AVAILABLE:
         logging.warning("Playwright not available.")
@@ -101,16 +103,12 @@ def try_playwright_for_brands_stealth():
                 viewport={'width': 390, 'height': 844}
             )
             page = context.new_page()
-            
-            # ✨ Stealth 모드 적용 ✨
             stealth_sync(page)
 
             logging.info("Playwright (Stealth): Navigating to brand ranking page.")
-            # 페이지 로드가 완료될 때까지 최대 60초 대기
             page.goto(ranking_url, wait_until="networkidle", timeout=60000)
             
             try:
-                # 랭킹 리스트가 나타날 때까지 최대 30초 대기
                 page.wait_for_selector("div.rank_brand_list > ul > li", timeout=30000)
                 logging.info("Playwright (Stealth): Ranking list element found successfully.")
             except Exception as e:
@@ -127,19 +125,92 @@ def try_playwright_for_brands_stealth():
         logging.exception("Playwright (Stealth) render error: %s", e)
         return None, f"Playwright (Stealth) failed. Check screenshot. Error: {str(e)}"
 
-# ... (Google Drive, 분석, Slack 함수는 이전과 동일하게 유지) ...
+# ---------------- Google Drive
 def build_drive_service_oauth():
-    # ...
+    if not (GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and GOOGLE_REFRESH_TOKEN):
+        logging.warning("OAuth env 미설정 (GOOGLE_CLIENT_ID/SECRET/REFRESH_TOKEN)")
+        return None
+    try:
+        creds = UserCredentials(
+            None, refresh_token=GOOGLE_REFRESH_TOKEN, client_id=GOOGLE_CLIENT_ID,
+            client_secret=GOOGLE_CLIENT_SECRET, token_uri="https://oauth2.googleapis.com/token",
+            scopes=["https://www.googleapis.com/auth/drive.file"],
+        )
+        creds.refresh(GoogleRequest())
+        service = build("drive", "v3", credentials=creds, cache_discovery=False)
+        return service
+    except Exception as e:
+        logging.exception("OAuth Drive service 생성 실패: %s", e)
+        return None
+
 def upload_csv_to_drive(service, csv_bytes, filename, folder_id=None):
-    # ...
+    if not service: return None
+    try:
+        media = MediaIoBaseUpload(BytesIO(csv_bytes), mimetype="text/csv", resumable=False)
+        body = {"name": filename}
+        if folder_id: body["parents"] = [folder_id]
+        f = service.files().create(body=body, media_body=media, fields="id,webViewLink,name").execute()
+        logging.info("Uploaded to Drive: id=%s name=%s link=%s", f.get("id"), f.get("name"), f.get("webViewLink"))
+        return f
+    except Exception as e:
+        logging.exception("Drive upload 실패: %s", e)
+        return None
+
 def find_csv_by_exact_name(service, folder_id: str, filename: str):
-    # ...
+    try:
+        q = f"name='{filename}' and '{folder_id}' in parents and mimeType='text/csv'"
+        res = service.files().list(q=q, pageSize=1, fields="files(id,name,createdTime)").execute()
+        files = res.get("files", [])
+        return files[0] if files else None
+    except Exception as e:
+        logging.exception("find_csv_by_exact_name error: %s", e)
+        return None
+        
 def download_file_from_drive(service, file_id):
-    # ...
+    try:
+        request = service.files().get_media(fileId=file_id)
+        fh = BytesIO()
+        downloader = MediaIoBaseDownload(fh, request)
+        done = False
+        while not done: status, done = downloader.next_chunk()
+        fh.seek(0)
+        return fh.read().decode("utf-8")
+    except Exception as e:
+        logging.exception("download_file_from_drive error: %s", e)
+        return None
+
+# ---------------- 분석
 def analyze_brand_trends(today_items, prev_items, top_window=TOP_WINDOW):
-    # ...
+    prev_map = {p.get("brand_name"): p.get("rank") for p in (prev_items or [])}
+    prev_top_brands = {p.get("brand_name") for p in (prev_items or []) if p.get("rank") and p.get("rank") <= top_window}
+    trends = []
+    for it in today_items:
+        brand_name = it["brand_name"]
+        prev_rank = prev_map.get(brand_name)
+        trends.append({
+            "brand_name": brand_name, "rank": it['rank'], "prev_rank": prev_rank,
+            "change": prev_rank - it['rank'] if prev_rank else None,
+        })
+    movers = [t for t in trends if t.get("prev_rank")]
+    up_sorted = sorted(movers, key=lambda x: x["change"], reverse=True)
+    down_sorted = sorted(movers, key=lambda x: x["change"])
+    chart_ins = [t for t in trends if t["prev_rank"] is None and t["rank"] <= top_window]
+    today_brands = {t["brand_name"] for t in today_items}
+    rank_out_brands = [nm for nm in prev_top_brands if nm not in today_brands]
+    rank_out = [p for p in (prev_items or []) if p.get("brand_name") in rank_out_brands]
+    in_out_count = len(chart_ins) + len(rank_out)
+    return up_sorted, down_sorted, chart_ins, rank_out, in_out_count
+
+# ---------------- Slack
 def send_slack_text(text):
-    # ...
+    if not SLACK_WEBHOOK:
+        logging.warning("No SLACK_WEBHOOK configured.")
+        return False
+    try:
+        res = requests.post(SLACK_WEBHOOK, json={"text": text}, timeout=10)
+        return res.status_code // 100 == 2
+    except Exception:
+        return False
 
 # ---------------- 메인
 def main():
@@ -148,12 +219,10 @@ def main():
     yesterday_kst = (now_kst - timedelta(days=1)).date()
     logging.info("Build: oy-brand-rank-app %s", today_kst.isoformat())
 
-    # --- ✨ 수정된 크롤링 로직: 이제 Playwright를 우선적으로 사용 ---
     logging.info("Start scraping brand ranking (Playwright Stealth First)")
     items, sample = try_playwright_for_brands_stealth()
 
     if not items:
-        # 만약을 위한 HTTP 재시도
         logging.warning("Playwright failed, trying HTTP request as a last resort.")
         items, sample = fetch_brand_ranking_data()
 
@@ -162,7 +231,6 @@ def main():
         send_slack_text(f"❌ OliveYoung Mobile Brand Ranking scraping failed.\nLast message: {(sample or '')[:800]}")
         return 1
     
-    # ... (CSV 생성 및 이후 로직은 이전과 동일) ...
     os.makedirs(OUT_DIR, exist_ok=True)
     fname_today = f"올리브영_브랜드랭킹_{today_kst.isoformat()}.csv"
     header = ["rank", "brand_name", "representative_product", "url"]
