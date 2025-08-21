@@ -1,39 +1,35 @@
-name: oliveyoung_brand_ranking
+# .github/workflows/brand_crawler.yml
+
+name: 올리브영 브랜드 랭킹 크롤러
 
 on:
-  schedule:
-    # GitHub Actions는 UTC 기준. 한국시간 23:06 = UTC 14:06
-    - cron: "6 14 * * *"
   workflow_dispatch:
+  schedule:
+    - cron: '00 16 * * *'
 
 jobs:
   build-and-run:
-    runs-on: ubuntu-latest # 실행 환경
+    runs-on: ubuntu-latest
 
     steps:
-      # 1. 저장소 코드 가져오기
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # 2. 파이썬 환경 설정
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11' # 파이썬 버전 지정
+          python-version: '3.11'
 
-      # 3. 파이썬 라이브러리 설치
+      # --- ✨ 수정된 부분 ---
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests beautifulsoup4 google-api-python-client google-auth-httplib2 google-auth-oauthlib playwright
+          pip install requests beautifulsoup4 google-api-python-client google-auth-httplib2 google-auth-oauthlib playwright playwright-stealth
 
-      # 4. Playwright 브라우저 설치 (HTTP 크롤링 실패 시 fallback을 위함)
       - name: Install Playwright Browsers
         run: playwright install --with-deps chromium
 
-      # 5. 브랜드 랭킹 크롤러 스크립트 실행
       - name: Run Brand Ranking Crawler
-        # GitHub Secrets에 저장된 값들을 환경 변수로 설정하여 스크립트에 전달
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
           GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
@@ -42,10 +38,18 @@ jobs:
           GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
         run: python brand_rank_app.py
 
-      # 6. (선택사항) 생성된 CSV 파일을 아티팩트로 업로드 (디버깅 및 백업용)
+      - name: Upload debug screenshot on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-screenshot
+          path: debug_screenshot.png
+          retention-days: 5 # 스크린샷 보관 기간
+
       - name: Upload ranking data artifact
-        if: always() # 스크립트 성공/실패 여부와 관계없이 항상 실행
+        if: success() # 성공했을 때만 CSV 업로드
         uses: actions/upload-artifact@v4
         with:
           name: brand-ranking-csv
-          path: rankings/ # rankings 폴더 안의 모든 파일을 업로드
+          path: rankings/
+          retention-days: 14 # CSV 보관 기간
