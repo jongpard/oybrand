@@ -41,7 +41,7 @@ SCREENSHOT_PATH = "debug_screenshot.png" # 에러 발생 시 스크린샷 저장
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 
-# ---------------- 유틸 (이전과 동일)
+# ---------------- 유틸
 def kst_now():
     return datetime.now(timezone.utc) + timedelta(hours=9)
 
@@ -56,7 +56,7 @@ def make_session():
     })
     return s
 
-# ---------------- 파싱/정제 (이전과 동일)
+# ---------------- 파싱/정제
 def parse_brand_html(html: str):
     soup = BeautifulSoup(html, "html.parser")
     list_items = soup.select("div.rank_brand_list > ul > li")
@@ -92,7 +92,6 @@ def fetch_brand_ranking_data():
         logging.exception("HTTP 요청 실패: %s", e)
         return None, str(e)
 
-# --- ✨ 안정성이 강화된 Playwright Fallback 함수 ---
 def try_playwright_for_brands():
     if not PLAYWRIGHT_AVAILABLE:
         logging.warning("Playwright not available.")
@@ -111,24 +110,20 @@ def try_playwright_for_brands():
             )
             page = context.new_page()
             
-            # 1. 메인 페이지를 먼저 방문하여 세션 활성화
             logging.info("Playwright: Visiting main page first to get session cookies.")
             page.goto(main_url, wait_until="domcontentloaded", timeout=30000)
-            page.wait_for_timeout(2000) # 팝업 등 로딩 대기
+            page.wait_for_timeout(2000)
             
-            # 2. 브랜드 랭킹 페이지로 이동
             logging.info("Playwright: Navigating to brand ranking page.")
             page.goto(ranking_url, wait_until="networkidle", timeout=40000)
             
-            # 3. 랭킹 리스트가 나타날 때까지 최대 20초 대기
             try:
                 page.wait_for_selector("div.rank_brand_list > ul > li", timeout=20000)
                 logging.info("Playwright: Ranking list element found.")
             except Exception as e:
-                # 타임아웃 발생 시 스크린샷 저장
                 page.screenshot(path=SCREENSHOT_PATH)
                 logging.error("Playwright: Timeout waiting for selector. Debug screenshot saved to %s", SCREENSHOT_PATH)
-                raise e # 에러를 다시 발생시켜 catch 블록으로 넘김
+                raise e
 
             html = page.content()
             items = parse_brand_html(html)
@@ -137,11 +132,94 @@ def try_playwright_for_brands():
             
     except Exception as e:
         logging.exception("Playwright render error: %s", e)
-        # 스크린샷 파일이 존재하면 아티팩트로 업로드할 수 있도록 경로 반환
         return None, f"Playwright failed. Check screenshot artifact if available. Error: {str(e)}"
 
-# ... (Google Drive, 분석, Slack 함수는 이전과 동일하게 유지) ...
-# (이하 생략 - 이전 답변의 Google Drive, 분석, Slack, 메인 함수 부분을 그대로 사용하시면 됩니다)
+# ---------------- Google Drive
+def build_drive_service_oauth():
+    if not (GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and GOOGLE_REFRESH_TOKEN):
+        logging.warning("OAuth env 미설정 (GOOGLE_CLIENT_ID/SECRET/REFRESH_TOKEN)")
+        return None
+    try:
+        creds = UserCredentials(
+            None, refresh_token=GOOGLE_REFRESH_TOKEN, client_id=GOOGLE_CLIENT_ID,
+            client_secret=GOOGLE_CLIENT_SECRET, token_uri="https://oauth2.googleapis.com/token",
+            scopes=["https://www.googleapis.com/auth/drive.file"],
+        )
+        creds.refresh(GoogleRequest())
+        service = build("drive", "v3", credentials=creds, cache_discovery=False)
+        return service
+    except Exception as e:
+        logging.exception("OAuth Drive service 생성 실패: %s", e)
+        return None
+
+def upload_csv_to_drive(service, csv_bytes, filename, folder_id=None):
+    if not service: return None
+    try:
+        media = MediaIoBaseUpload(BytesIO(csv_bytes), mimetype="text/csv", resumable=False)
+        body = {"name": filename}
+        if folder_id: body["parents"] = [folder_id]
+        f = service.files().create(body=body, media_body=media, fields="id,webViewLink,name").execute()
+        logging.info("Uploaded to Drive: id=%s name=%s link=%s", f.get("id"), f.get("name"), f.get("webViewLink"))
+        return f
+    except Exception as e:
+        logging.exception("Drive upload 실패: %s", e)
+        return None
+
+def find_csv_by_exact_name(service, folder_id: str, filename: str):
+    try:
+        q = f"name='{filename}' and '{folder_id}' in parents and mimeType='text/csv'"
+        res = service.files().list(q=q, pageSize=1, fields="files(id,name,createdTime)").execute()
+        files = res.get("files", [])
+        return files[0] if files else None
+    except Exception as e:
+        logging.exception("find_csv_by_exact_name error: %s", e)
+        return None
+        
+def download_file_from_drive(service, file_id):
+    try:
+        request = service.files().get_media(fileId=file_id)
+        fh = BytesIO()
+        downloader = MediaIoBaseDownload(fh, request)
+        done = False
+        while not done: status, done = downloader.next_chunk()
+        fh.seek(0)
+        return fh.read().decode("utf-8")
+    except Exception as e:
+        logging.exception("download_file_from_drive error: %s", e)
+        return None
+
+# ---------------- 분석
+def analyze_brand_trends(today_items, prev_items, top_window=TOP_WINDOW):
+    prev_map = {p.get("brand_name"): p.get("rank") for p in (prev_items or [])}
+    prev_top_brands = {p.get("brand_name") for p in (prev_items or []) if p.get("rank") and p.get("rank") <= top_window}
+    trends = []
+    for it in today_items:
+        brand_name = it["brand_name"]
+        prev_rank = prev_map.get(brand_name)
+        trends.append({
+            "brand_name": brand_name, "rank": it['rank'], "prev_rank": prev_rank,
+            "change": prev_rank - it['rank'] if prev_rank else None,
+        })
+    movers = [t for t in trends if t.get("prev_rank")]
+    up_sorted = sorted(movers, key=lambda x: x["change"], reverse=True)
+    down_sorted = sorted(movers, key=lambda x: x["change"])
+    chart_ins = [t for t in trends if t["prev_rank"] is None and t["rank"] <= top_window]
+    today_brands = {t["brand_name"] for t in today_items}
+    rank_out_brands = [nm for nm in prev_top_brands if nm not in today_brands]
+    rank_out = [p for p in (prev_items or []) if p.get("brand_name") in rank_out_brands]
+    in_out_count = len(chart_ins) + len(rank_out)
+    return up_sorted, down_sorted, chart_ins, rank_out, in_out_count
+
+# ---------------- Slack
+def send_slack_text(text):
+    if not SLACK_WEBHOOK:
+        logging.warning("No SLACK_WEBHOOK configured.")
+        return False
+    try:
+        res = requests.post(SLACK_WEBHOOK, json={"text": text}, timeout=10)
+        return res.status_code // 100 == 2
+    except Exception:
+        return False
 
 # ---------------- 메인
 def main():
@@ -150,7 +228,6 @@ def main():
     yesterday_kst = (now_kst - timedelta(days=1)).date()
     logging.info("Build: oy-brand-rank-app %s", today_kst.isoformat())
 
-    # --- 크롤링 로직 (Playwright Fallback) ---
     logging.info("Start scraping brand ranking (HTTP First)")
     items, sample = fetch_brand_ranking_data()
     
@@ -163,7 +240,6 @@ def main():
         send_slack_text(f"❌ OliveYoung Mobile Brand Ranking scraping failed.\n{(sample or '')[:800]}")
         return 1
     
-    # --- CSV 생성 및 업로드 ---
     os.makedirs(OUT_DIR, exist_ok=True)
     fname_today = f"올리브영_브랜드랭킹_{today_kst.isoformat()}.csv"
     header = ["rank", "brand_name", "representative_product", "url"]
@@ -183,7 +259,6 @@ def main():
     else:
         logging.warning("OAuth Drive 미설정 또는 폴더ID 누락 -> 업로드 스킵")
 
-    # --- 전일 데이터 로드 및 분석 ---
     prev_items = None
     if drive_service and GDRIVE_FOLDER_ID:
         fname_yesterday = f"올리브영_브랜드랭킹_{yesterday_kst.isoformat()}.csv"
@@ -203,7 +278,6 @@ def main():
     
     up, down, chart_ins, rank_out, in_out_count = analyze_brand_trends(items, prev_items or [], TOP_WINDOW)
 
-    # --- Slack 메시지 구성 ---
     title = f"*올리브영 모바일 브랜드 랭킹 100* ({now_kst.strftime('%Y-%m-%d %H:%M KST')})"
     out_lines = [title]
     out_lines.append("\n*🏆 TOP 10 브랜드*")
@@ -223,64 +297,4 @@ def main():
     return 0
 
 if __name__ == "__main__":
-    exit(main())```
-
-### **워크플로우 파일 수정 (`brand_crawler.yml`)**
-
-에러 발생 시 스크린샷을 아티팩트로 저장하여 원인을 쉽게 파악할 수 있도록 워크플로우 파일에 한 단계를 추가합니다.
-
-```yaml
-# .github/workflows/brand_crawler.yml
-
-name: 올리브영 브랜드 랭킹 크롤러
-
-on:
-  workflow_dispatch:
-  schedule:
-    - cron: '00 16 * * *'
-
-jobs:
-  build-and-run:
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install requests beautifulsoup4 google-api-python-client google-auth-httplib2 google-auth-oauthlib playwright
-
-      - name: Install Playwright Browsers
-        run: playwright install --with-deps chromium
-
-      - name: Run Brand Ranking Crawler
-        env:
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
-          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
-          GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
-          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
-        run: python brand_rank_app.py
-
-      # --- ✨ 수정/추가된 부분 ---
-      - name: Upload debug screenshot on failure
-        # 스크립트가 실패했을 때만 이 단계를 실행
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: debug-screenshot
-          path: debug_screenshot.png # 스크립트가 생성한 스크린샷 파일
-
-      - name: Upload ranking data artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: brand-ranking-csv
-          path: rankings/
+    exit(main())
