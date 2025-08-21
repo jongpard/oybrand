@@ -2,7 +2,7 @@ name: oliveyoung_brand_ranking
 
 on:
   schedule:
-    # GitHub Actions는 UTC 기준. 한국시간(KST) 23:06 = UTC 14:06
+    # GitHub Actions는 UTC 기준. 한국시간 23:06 = UTC 14:06
     - cron: "6 14 * * *"
   workflow_dispatch:
 
@@ -22,26 +22,22 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install playwright==1.45.0 openpyxl requests \
+          pip install requests openpyxl \
             google-api-python-client google-auth google-auth-httplib2 google-auth-oauthlib
-          python -m playwright install --with-deps chromium
 
-      - name: Run brand crawler
+      - name: Run brand crawler (Oxylabs API)
         env:
-          # 필수/선택 시크릿
+          # 슬랙/드라이브(있으면 연결)
           SLACK_WEBHOOK_URL:   ${{ secrets.SLACK_WEBHOOK_URL }}
           GDRIVE_FOLDER_ID:    ${{ secrets.GDRIVE_FOLDER_ID }}
           GOOGLE_CLIENT_ID:    ${{ secrets.GOOGLE_CLIENT_ID }}
           GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
           GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
 
-          # 스크래핑 API (무료/체험 크레딧 사용)
-          SCRAPING_API:        ${{ secrets.SCRAPING_API }}        # 예: scraperapi 또는 zenrows
-          SCRAPING_API_KEY:    ${{ secrets.SCRAPING_API_KEY }}
-
-          # (옵션) 클라우드플레어 대비 - 보통은 비워둠
-          PROXY_SERVER:        ${{ secrets.PROXY_SERVER }}
-          CF_CLEARANCE:        ${{ secrets.CF_CLEARANCE }}
+          # Oxylabs Realtime (API형) — Basic Auth
+          SCRAPING_API: oxylabs
+          OXY_USER: ${{ secrets.OXY_USER }}
+          OXY_PASS: ${{ secrets.OXY_PASS }}
         run: |
           mkdir -p data
           python app_brand.py
@@ -54,13 +50,10 @@ jobs:
           path: data/올리브영_브랜드_순위.xlsx
           if-no-files-found: warn
 
-      - name: Upload debug artifacts
+      - name: Upload debug artifact (HTML)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: brand_debug
-          path: |
-            data/brand_debug.png
-            data/brand_debug.json
-            data/brand_debug.html
+          path: data/brand_debug.html
           if-no-files-found: ignore
