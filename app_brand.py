@@ -1,15 +1,21 @@
-# app_brand.py
 # -*- coding: utf-8 -*-
+"""
+올리브영 모바일 '브랜드 랭킹' 크롤러
+- ScraperAPI/ZenRows 등 스크래핑 API 우선 사용 (무료/체험 크레딧 활용)
+- 실패 시 Playwright(모바일 에뮬 + 선택적 프록시/쿠키) 폴백
+- 엑셀: 월 시트 자동 생성, 일자 열 덮어쓰기 갱신
+- 슬랙 Top10 (전일 대비 등락), 구글 드라이브 업로드
+"""
 
 import asyncio
 import os
 import re
 import json
+import urllib.parse
 from datetime import datetime, timedelta, date
 from zoneinfo import ZoneInfo
 from calendar import monthrange
 from collections import OrderedDict
-from urllib.parse import urlparse
 
 import requests
 from openpyxl import Workbook, load_workbook
@@ -39,9 +45,13 @@ GOOGLE_CLIENT_ID     = os.environ.get("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
 GOOGLE_REFRESH_TOKEN = os.environ.get("GOOGLE_REFRESH_TOKEN", "")
 
-# Cloudflare 우회(옵션)
+# Scraping API
+SCRAPING_API         = os.environ.get("SCRAPING_API", "").lower()   # "scraperapi" | "zenrows"
+SCRAPING_API_KEY     = os.environ.get("SCRAPING_API_KEY", "")
+
+# (옵션) Cloudflare 회피 보조
 PROXY_SERVER         = os.environ.get("PROXY_SERVER", "")      # 예: http://user:pass@host:port
-CF_CLEARANCE         = os.environ.get("CF_CLEARANCE", "")      # m.oliveyoung.co.kr 의 cf_clearance 값
+CF_CLEARANCE         = os.environ.get("CF_CLEARANCE", "")
 
 # -------------------------
 # 유틸/정규화
@@ -58,29 +68,77 @@ def normalize_brand_text(t: str) -> str | None:
     s = re.sub(r"\s+", " ", t).strip()
     if not s:
         return None
-    # 자주 붙는 꼬리표 컷
     s = re.sub(r"\s*(브랜드\s*썸네일|로고.*|이미지.*|타이틀.*)$", "", s).strip()
-    # 코드/숫자 포함 컷
     for p in CODE_PATTERNS:
         if p.match(s):
             return None
     if re.search(r"\d", s):
         return None
-    # 길이/단어수 제한
     if len(s) > 30 or len(s.split()) > 6:
         return None
-    # 1글자는 한글만 허용(‘려’ 등)
     if len(s) == 1 and not re.fullmatch(r"[가-힣]", s):
         return None
-    # 너무 일반적인 영단어 컷
     if s.lower() in {"brand", "logo", "image", "title"}:
         return None
     return s
 
+# -------------------------
+# Scraping API
+# -------------------------
+def fetch_html_via_scraping_api(url: str) -> str | None:
+    """스크래핑 API로 렌더된 HTML 가져오기 (설정돼 있으면 우선 사용)"""
+    if not (SCRAPING_API and SCRAPING_API_KEY):
+        return None
+
+    enc = urllib.parse.quote_plus(url)
+
+    if SCRAPING_API == "zenrows":
+        api_url = (
+            f"https://proxy.zenrows.com/?apikey={SCRAPING_API_KEY}&url={enc}"
+            f"&js_render=true&premium_proxy=true&country=kr"
+        )
+    elif SCRAPING_API == "scraperapi":
+        # 플랜에 따라 country/device가 제한되면 해당 파라미터는 제거해도 작동 가능
+        api_url = (
+            f"https://api.scraperapi.com/?api_key={SCRAPING_API_KEY}&url={enc}"
+            f"&render=true&country_code=kr&device_type=mobile&session_number=1&retry_404=true"
+        )
+    else:
+        return None
+
+    try:
+        r = requests.get(api_url, timeout=40)
+        r.raise_for_status()
+        return r.text
+    except Exception as e:
+        print(f"[ScrapingAPI] 요청 실패: {e}")
+        return None
+
+def extract_brands_from_html(html: str) -> list[str]:
+    """렌더된 HTML에서 script JSON을 정규식으로 스캔하여 brandsInfo.brandName만 추출"""
+    if not html:
+        return []
+    names = []
+    # 대표 패턴: ... "brandsInfo": { ..., "brandName": "메디힐", ... }
+    for m in re.finditer(r'brandsInfo"\s*:\s*{[^}]*"brandName"\s*:\s*"([^"]+)"', html):
+        nm = normalize_brand_text(m.group(1))
+        if nm:
+            names.append(nm)
+    # 백업: brandName 키 전체 탐색
+    if not names:
+        for m in re.finditer(r'"brandName"\s*:\s*"([^"]+)"', html):
+            nm = normalize_brand_text(m.group(1))
+            if nm:
+                names.append(nm)
+    return list(OrderedDict.fromkeys(names))[:100]
+
+# -------------------------
+# Playwright helpers (폴백용)
+# -------------------------
 def parse_proxy(proxy_url: str) -> dict | None:
-    """Playwright proxy dict로 변환"""
     if not proxy_url:
         return None
+    from urllib.parse import urlparse
     u = urlparse(proxy_url)
     if not (u.scheme and u.hostname and u.port):
         return None
@@ -91,11 +149,7 @@ def parse_proxy(proxy_url: str) -> dict | None:
         proxy["password"] = u.password
     return proxy
 
-# -------------------------
-# Playwright helpers
-# -------------------------
 async def maybe_click_brand_tab(page):
-    """상단에서 '브랜드 랭킹' 탭 확실히 선택"""
     sels = [
         "role=tab[name='브랜드 랭킹']",
         "button:has-text('브랜드 랭킹')",
@@ -107,13 +161,12 @@ async def maybe_click_brand_tab(page):
             el = await page.wait_for_selector(sel, timeout=1500)
             if el:
                 await el.click(timeout=800)
-                await page.wait_for_timeout(500)
+                await page.wait_for_timeout(400)
                 break
         except Exception:
             pass
 
 async def close_banners(page):
-    """앱 유도/팝업 닫기(있으면)"""
     candidates = [
         "[aria-label*='닫기']","button[aria-label*='닫기']","[class*='btn_close']",
         "text=닫기","text=취소","text=나중에",
@@ -127,39 +180,8 @@ async def close_banners(page):
         except Exception:
             pass
 
-async def switch_to_brand_only_list(page):
-    """오른쪽 동그란 '리스트 보기' 버튼 자동 클릭 시도(브랜드명만 크게 보이는 뷰)"""
-    sels = [
-        "button[aria-label*='리스트']", "button[aria-label*='목록']",
-        "button[title*='리스트']", ".btn_list", ".btnList", ".ico_list",
-        ".type_list", ".view_list", "button:has-text('리스트')"
-    ]
-    for sel in sels:
-        try:
-            btn = await page.query_selector(sel)
-            if btn:
-                await btn.click(timeout=800)
-                await page.wait_for_timeout(500)
-                return True
-        except Exception:
-            pass
-    # '일간' 텍스트 주변 버튼 클릭(마지막 수단)
-    try:
-        tg = page.locator("text=일간").first
-        if await tg.count() > 0:
-            par = tg.locator("xpath=ancestor::*[position()<=3]").first
-            btns = par.locator("button")
-            n = await btns.count()
-            if n:
-                await btns.nth(n-1).click(timeout=800)
-                await page.wait_for_timeout(500)
-                return True
-    except Exception:
-        pass
-    return False
-
 async def click_more_until_end(page, max_clicks=12):
-    texts = ["더보기", "더 보기", "More", "more"]
+    texts = ["더보기","더 보기","More","more"]
     for _ in range(max_clicks):
         clicked = False
         for t in texts:
@@ -190,20 +212,13 @@ async def scroll_to_bottom(page, pause_ms=900, max_loops=60):
             break
 
 def is_cf_block_html(html: str) -> bool:
-    if not html:
-        return False
-    return ("사람인지 확인" in html) or ("Cloudflare" in html and "확인" in html)
+    return bool(html) and (("사람인지 확인" in html) or ("Cloudflare" in html and "확인" in html))
 
-# -------------------------
-# JSON(네트워크 응답)에서 브랜드명만 추출
-# -------------------------
 def extract_brands_from_json_objs(json_objs):
-    """응답의 data[*].brandsInfo.brandName만 모아서 순서대로 반환"""
+    """네트워크 JSON에서 data[*].brandsInfo.brandName만 추출"""
     names = []
-
     def walk(node):
         if isinstance(node, dict):
-            # 대표 구조: { ..., "brandsInfo": {"brandName": "메디힐", ...}, "goodsInfo": [...] }
             bi = node.get("brandsInfo") or node.get("brandInfo")
             if isinstance(bi, dict):
                 nm = (
@@ -219,10 +234,8 @@ def extract_brands_from_json_objs(json_objs):
         elif isinstance(node, list):
             for it in node:
                 walk(it)
-
     for jo in json_objs:
         try:
-            # 우선 data 루트에 있으면 빠르게 긁고
             data = jo.get("data")
             if isinstance(data, list):
                 for item in data:
@@ -235,80 +248,36 @@ def extract_brands_from_json_objs(json_objs):
                         nm = normalize_brand_text(nm)
                         if nm:
                             names.append(nm)
-            # 전체 탐색
             walk(jo)
         except Exception:
             pass
-
-    return list(OrderedDict.fromkeys(names))[:100]  # 순서 유지 중복 제거
-
-# -------------------------
-# DOM 보조 추출(혹시 JSON이 부족할 때만)
-# -------------------------
-BRAND_CONTAINER_CANDIDATES = [
-    "[class*='brand'][class*='list']",
-    "[class*='brand'][class*='wrap']",
-    "[class*='brand'][class*='container']",
-    "#contents, #container, main",
-]
-BRAND_NAME_CANDIDATE_SELECTORS = [
-    ".brand, .brandName, .tx_brand, .brand-name, .tit, .name, .txt, .title",
-    "strong[class*='brand'], span[class*='brand'], em[class*='brand']",
-]
-
-async def extract_brands_from_dom(page):
-    brands = []
-    for cont_sel in BRAND_CONTAINER_CANDIDATES:
-        try:
-            containers = await page.query_selector_all(cont_sel)
-        except Exception:
-            containers = []
-        for c in containers:
-            for sels in BRAND_NAME_CANDIDATE_SELECTORS:
-                try:
-                    nodes = await c.query_selector_all(sels)
-                    for n in nodes:
-                        try:
-                            t = (await n.inner_text()).strip()
-                            nb = normalize_brand_text(t)
-                            if nb:
-                                brands.append(nb)
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
-            # 로고 alt 보조
-            try:
-                imgs = await c.query_selector_all("img[alt]")
-                for im in imgs:
-                    try:
-                        alt = (await im.get_attribute("alt")) or ""
-                        nb = normalize_brand_text(alt)
-                        if nb:
-                            brands.append(nb)
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-    return list(OrderedDict.fromkeys(brands))[:100]
+    return list(OrderedDict.fromkeys(names))[:100]
 
 # -------------------------
 # 크롤링 본체
 # -------------------------
 async def scrape_top100():
+    # 0) 스크래핑 API 우선 시도 (내 PC 없이 동작)
+    html = fetch_html_via_scraping_api(URL)
+    if html:
+        brands = extract_brands_from_html(html)
+        if brands:
+            print("[ScrapingAPI] HTML 추출 성공")
+            os.makedirs(OUTPUT_DIR, exist_ok=True)
+            with open(os.path.join(OUTPUT_DIR, "brand_debug.html"), "w", encoding="utf-8") as f:
+                f.write(html[:200000])
+            return brands
+        else:
+            print("[ScrapingAPI] HTML 추출 실패 - Playwright 폴백 시도")
+
+    # 1) (API 미설정/실패 시) Playwright 폴백
     json_payloads = []
     proxy = parse_proxy(PROXY_SERVER)
-
     async with async_playwright() as p:
-        # 모바일 에뮬레이션 + 프록시
         iphone = p.devices.get("iPhone 13 Pro")
-        browser = await p.chromium.launch(
-            headless=True,
-            proxy=proxy  # None이면 무시
-        )
+        browser = await p.chromium.launch(headless=True, proxy=proxy)
         context = await browser.new_context(**iphone, locale="ko-KR")
-
-        # cf_clearance 쿠키 주입(옵션)
+        # cf_clearance 주입(옵션)
         if CF_CLEARANCE:
             try:
                 await context.add_cookies([{
@@ -317,7 +286,6 @@ async def scrape_top100():
                     "domain": ".oliveyoung.co.kr",
                     "path": "/",
                     "secure": True,
-                    "httpOnly": False,
                 }])
                 print("[CF] cf_clearance 쿠키 주입 완료")
             except Exception as e:
@@ -325,11 +293,10 @@ async def scrape_top100():
 
         page = await context.new_page()
 
-        # 브랜드 랭킹 JSON 캡처
         async def on_response(resp):
             try:
                 url = resp.url.lower()
-                ctype = resp.headers.get("content-type", "").lower()
+                ctype = resp.headers.get("content-type","").lower()
                 if ("brand" in url or "ranking" in url or "best" in url) and "application/json" in ctype:
                     jo = await resp.json()
                     json_payloads.append(jo)
@@ -343,26 +310,20 @@ async def scrape_top100():
         await maybe_click_brand_tab(page)
         await page.wait_for_timeout(400)
 
-        # 리스트 보기 전환(브랜드명만 크게)
-        await switch_to_brand_only_list(page)
-
         await click_more_until_end(page)
         await scroll_to_bottom(page, pause_ms=900, max_loops=60)
         await page.wait_for_timeout(800)
 
-        # 차단 감지
-        html = await page.content()
-        if is_cf_block_html(html):
-            print("[경고] Cloudflare 차단 페이지 감지 — 프록시/쿠키 확인 필요")
+        html2 = await page.content()
+        if is_cf_block_html(html2):
+            print("[경고] Cloudflare 차단 페이지 감지 — API/프록시/국내 IP 필요")
 
         brands = extract_brands_from_json_objs(json_payloads)
-
-        # JSON이 부족하면 DOM 백업 결합(순서 유지)
         if len(brands) < 50:
-            dom_brands = await extract_brands_from_dom(page)
-            brands = list(OrderedDict.fromkeys(brands + dom_brands))[:100]
+            # 폴백으로 HTML에서라도 추출 시도
+            brands_html = extract_brands_from_html(html2)
+            brands = list(OrderedDict.fromkeys(brands + brands_html))[:100]
 
-        # 디버그 저장(Artifacts로 올리려면 워크플로에서 업로드)
         os.makedirs(OUTPUT_DIR, exist_ok=True)
         try:
             await page.screenshot(path=os.path.join(OUTPUT_DIR, "brand_debug.png"), full_page=True)
@@ -500,14 +461,14 @@ def post_slack_top10(brands, ymap, now):
     }
     try:
         r = requests.post(SLACK_WEBHOOK_URL, data=json.dumps(payload),
-                          headers={"Content-Type":"application/json"}, timeout=10)
+                          headers={"Content-Type":"application/json"}, timeout=12)
         r.raise_for_status()
         print("[슬랙] Top10 전송 완료")
     except Exception as e:
         print(f"[슬랙] 전송 실패: {e}")
 
 # -------------------------
-# 구글 드라이브 업로드 (drive.file 스코프, 실패해도 파이프라인 유지)
+# 구글 드라이브 업로드 (drive.file 스코프)
 # -------------------------
 def build_drive_service():
     if not (GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and GOOGLE_REFRESH_TOKEN and GDRIVE_FOLDER_ID):
@@ -560,7 +521,7 @@ def upload_or_update_to_drive(filepath, folder_id):
 async def main():
     brands = await scrape_top100()
     if not brands:
-        print("[경고] 브랜드 0개 수집 — 프록시/쿠키 또는 차단 상태 확인 필요")
+        print("[경고] 브랜드 0개 수집 — API 키/크레딧 또는 차단 상태 확인 필요")
     else:
         print(f"[INFO] 브랜드 {len(brands)}개 수집")
 
