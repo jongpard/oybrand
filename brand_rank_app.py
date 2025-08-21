@@ -1,217 +1,451 @@
-#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# brand_rank_app.py — 올리브영 모바일 브랜드 랭킹 크롤링 (최종 안정화)
+"""
+올리브영 '브랜드 랭킹' 자동 수집 (GitHub Actions 전용)
+우선순위:
+  1) Oxylabs Realtime API(Universal)로 렌더된 HTML 수신
+  2) Web Unblocker 프록시 + Playwright로 페이지 로드 & 네트워크 JSON 파싱
+  3) 둘 다 실패 시 디버그 아티팩트 남기고 슬랙에 실패 알림
 
-import os
-import re
-import json
-import logging
-from io import BytesIO, StringIO
-from datetime import datetime, timedelta, timezone
+결과:
+  - data/올리브영_브랜드_순위.xlsx (월 시트 자동 생성/갱신)
+  - 슬랙 Top10 (전일 대비 등락 표기)
+  - debug: brand_debug.html/png, brand_api_response.json
+"""
+
+import os, re, json, asyncio
+from collections import OrderedDict
+from datetime import datetime, timedelta, date
+from zoneinfo import ZoneInfo
+from calendar import monthrange
 
 import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-from bs4 import BeautifulSoup
+from openpyxl import Workbook, load_workbook
+from openpyxl.utils import get_column_letter
+from openpyxl.styles import Alignment, Font
 
-# Playwright & Stealth - 이제 필수 라이브러리이므로 예외 처리 없이 바로 import합니다.
-# 만약 설치에 문제가 있었다면 여기서 바로 ImportError가 발생하여 원인을 알 수 있습니다.
-from playwright.sync_api import sync_playwright
-from playwright_stealth import stealth_sync
+# ----- Playwright (프록시 폴백용)
+from urllib.parse import urlparse
+from playwright.async_api import async_playwright
 
-# Google Drive (OAuth)
+# ----- Google Drive (선택)
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
-from google.oauth2.credentials import Credentials as UserCredentials
-from google.auth.transport.requests import Request as GoogleRequest
+from googleapiclient.http import MediaFileUpload
+from google.oauth2.credentials import Credentials
 
-# ---------------- 설정(ENV)
-SLACK_WEBHOOK = os.environ.get("SLACK_WEBHOOK_URL", "").strip()
-GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "").strip()
-GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "").strip()
-GOOGLE_REFRESH_TOKEN = os.environ.get("GOOGLE_REFRESH_TOKEN", "").strip()
-GDRIVE_FOLDER_ID = os.environ.get("GDRIVE_FOLDER_ID", "").strip()
 
-OUT_DIR = "rankings"
-MAX_ITEMS = 100
-TOP_WINDOW = 30
-SCREENSHOT_PATH = "debug_screenshot.png"
+# =========================
+# 설정/시크릿
+# =========================
+KST = ZoneInfo("Asia/Seoul")
+URL = "https://m.oliveyoung.co.kr/m/mtn?menu=ranking&tab=brands"
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
+OUTPUT_DIR = "data"
+XLSX_NAME  = "올리브영_브랜드_순위.xlsx"
+OUTPUT_PATH = os.path.join(OUTPUT_DIR, XLSX_NAME)
 
-# ---------------- 유틸, 파싱 (이전과 동일)
-def kst_now():
-    return datetime.now(timezone.utc) + timedelta(hours=9)
+# env
+SCRAPING_API = os.environ.get("SCRAPING_API", "").lower()  # "oxylabs" 권장
+OXY_USER     = os.environ.get("OXY_USER", "")
+OXY_PASS     = os.environ.get("OXY_PASS", "")
 
-def parse_brand_html(html: str):
-    soup = BeautifulSoup(html, "html.parser")
-    list_items = soup.select("div.rank_brand_list > ul > li")
-    results = []
-    if not list_items:
-        logging.warning("HTML에서 브랜드 랭킹 리스트를 찾지 못했습니다.")
-        return []
-    for item in list_items[:MAX_ITEMS]:
-        rank_node = item.select_one(".rank_num"); rank = int(rank_node.get_text(strip=True)) if rank_node else None
-        brand_name_node = item.select_one(".brand_name"); brand_name = brand_name_node.get_text(strip=True) if brand_name_node else ""
-        link_node = item.select_one("a.brand_item"); href = link_node.get("href") if link_node else ""
-        if href and not href.startswith("http"): href = "https://m.oliveyoung.co.kr" + href
-        product_name_node = item.select_one(".prd_name"); product_name = product_name_node.get_text(strip=True) if product_name_node else ""
-        if rank and brand_name:
-            results.append({"rank": rank, "brand_name": brand_name, "representative_product": product_name, "url": href})
-    logging.info("parse_brand_html: %d개의 브랜드 순위를 파싱했습니다.", len(results))
-    return results
+PROXY_SERVER = os.environ.get("PROXY_SERVER", "")
 
-# --- Stealth 모드가 적용된 Playwright 함수 ---
-def crawl_with_playwright():
-    ranking_url = "https://m.oliveyoung.co.kr/m/mtn/ranking/getBrandRanking.do"
+SLACK_WEBHOOK_URL    = os.environ.get("SLACK_WEBHOOK_URL", "")
+GDRIVE_FOLDER_ID     = os.environ.get("GDRIVE_FOLDER_ID", "")
+GOOGLE_CLIENT_ID     = os.environ.get("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
+GOOGLE_REFRESH_TOKEN = os.environ.get("GOOGLE_REFRESH_TOKEN", "")
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+
+# =========================
+# 공통 유틸/정규화
+# =========================
+CODE_PATTERNS = [re.compile(r"^[A-Z]\d{4,}$"), re.compile(r"^\d{4,}$")]
+
+def normalize_brand_text(t: str) -> str | None:
+    if not isinstance(t, str) or not t:
+        return None
+    s = re.sub(r"[\u200b\ufeff]", "", t)
+    s = re.sub(r"\s+", " ", s).strip()
+    # 불필요 꼬리표 컷
+    s = re.sub(r"\s*(브랜드\s*썸네일|로고.*|이미지.*|타이틀.*)$", "", s).strip()
+    # 코드/숫자/과도한 길이 컷
+    for p in CODE_PATTERNS:
+        if p.match(s):
+            return None
+    if re.search(r"\d", s):
+        return None
+    if len(s) > 30 or len(s.split()) > 6:
+        return None
+    if len(s) == 1 and not re.fullmatch(r"[가-힣]", s):
+        return None
+    if s.lower() in {"brand","logo","image","title","브랜드","이미지","타이틀"}:
+        return None
+    return s
+
+def unique_keep_order(xs):
+    return list(OrderedDict.fromkeys(xs))
+
+# =========================
+# 1) Realtime API (우선)
+# =========================
+def fetch_html_via_oxylabs(url: str) -> str | None:
+    if SCRAPING_API != "oxylabs" or not (OXY_USER and OXY_PASS):
+        return None
     try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
-            context = browser.new_context(
-                user_agent="Mozilla/5.0 (iPhone; CPU iPhone OS 17_5_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17_5 Mobile/15E148 Safari/604.1",
-                locale="ko-KR",
-                viewport={'width': 390, 'height': 844}
-            )
-            page = context.new_page()
-            stealth_sync(page)
-
-            logging.info("Playwright (Stealth): Navigating to brand ranking page.")
-            page.goto(ranking_url, wait_until="networkidle", timeout=60000)
-            
+        payload = {
+            "source": "universal",
+            "url": url,
+            "render": "html",
+            "geo_location": "South Korea",
+            "user_agent_type": "mobile",
+        }
+        r = requests.post(
+            "https://realtime.oxylabs.io/v1/queries",
+            auth=(OXY_USER, OXY_PASS),  # Basic Auth
+            headers={"Content-Type": "application/json"},
+            data=json.dumps(payload),
+            timeout=60,
+        )
+        # 디버그 저장(에러 바디 포함)
+        with open(os.path.join(OUTPUT_DIR, "brand_api_response.json"), "w", encoding="utf-8") as f:
             try:
-                page.wait_for_selector("div.rank_brand_list > ul > li", timeout=30000)
-                logging.info("Playwright (Stealth): Ranking list element found successfully.")
-            except Exception as e:
-                page.screenshot(path=SCREENSHOT_PATH)
-                logging.error("Playwright (Stealth): Timeout waiting for selector. Debug screenshot saved.")
-                raise e
+                f.write(json.dumps(r.json(), ensure_ascii=False, indent=2))
+            except Exception:
+                f.write(r.text[:200000])
 
-            html = page.content()
-            items = parse_brand_html(html)
-            browser.close()
-            return items, html[:500]
-            
+        r.raise_for_status()
+        data = r.json()
+        results = data.get("results") or []
+        if results and "content" in results[0]:
+            return results[0]["content"]
+        print("[Oxylabs] content 없음")
     except Exception as e:
-        logging.exception("Playwright (Stealth) render error: %s", e)
-        return None, f"Playwright (Stealth) failed. Check screenshot. Error: {str(e)}"
+        print(f"[Oxylabs] 요청 실패: {e}")
+    return None
 
-# ---------------- Google Drive, 분석, Slack 함수 (이전과 동일)
-def build_drive_service_oauth():
-    if not (GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and GOOGLE_REFRESH_TOKEN): return None
+def extract_brands_from_html(html: str) -> list[str]:
+    if not html:
+        return []
+    names = []
+    for m in re.finditer(r'brandsInfo"\s*:\s*{[^}]*"brandName"\s*:\s*"([^"]+)"', html):
+        nm = normalize_brand_text(m.group(1))
+        if nm:
+            names.append(nm)
+    if not names:
+        for m in re.finditer(r'"brandName"\s*:\s*"([^"]+)"', html):
+            nm = normalize_brand_text(m.group(1))
+            if nm:
+                names.append(nm)
+    return unique_keep_order(names)[:100]
+
+# =========================
+# 2) Web Unblocker 프록시 + Playwright (폴백)
+# =========================
+def parse_proxy(proxy_url: str) -> dict | None:
+    if not proxy_url:
+        return None
+    u = urlparse(proxy_url)
+    if not (u.scheme and u.hostname and u.port):
+        return None
+    out = {"server": f"{u.scheme}://{u.hostname}:{u.port}"}
+    if u.username:
+        out["username"] = u.username
+    if u.password:
+        out["password"] = u.password
+    return out
+
+def is_cf_block_html(html: str) -> bool:
+    return bool(html) and (("사람인지 확인" in html) or ("Cloudflare" in html and "확인" in html))
+
+async def fetch_brands_via_playwright(url: str, proxy_url: str) -> list[str]:
+    proxy = parse_proxy(proxy_url)
+    json_payloads = []
+    async with async_playwright() as p:
+        iphone = p.devices.get("iPhone 13 Pro")
+        browser = await p.chromium.launch(headless=True, proxy=proxy)
+        context = await browser.new_context(
+            ignore_https_errors=True,   # 프록시 체인 TLS 에러 무시
+            **iphone,
+            locale="ko-KR",
+            extra_http_headers={
+                "X-Oxylabs-Geo-Location": "South Korea",
+                "X-Oxylabs-Render": "html",
+                "X-Oxylabs-Device-Type": "mobile",
+            },
+        )
+        page = await context.new_page()
+
+        async def on_response(resp):
+            try:
+                ctype = resp.headers.get("content-type","").lower()
+                if "application/json" in ctype:
+                    url_l = resp.url.lower()
+                    if any(k in url_l for k in ["brand","ranking","best"]):
+                        jo = await resp.json()
+                        json_payloads.append(jo)
+            except Exception:
+                pass
+        page.on("response", lambda r: asyncio.create_task(on_response(r)))
+
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+        except Exception as e:
+            print(f"[Playwright] goto 실패: {e}")
+
+        # 디버그 HTML/PNG 항상 저장
+        try:
+            html = await page.content()
+            with open(os.path.join(OUTPUT_DIR, "brand_debug.html"), "w", encoding="utf-8") as f:
+                f.write(html[:200000])
+            await page.screenshot(path=os.path.join(OUTPUT_DIR, "brand_debug.png"), full_page=True)
+        except Exception:
+            pass
+
+        # 간단 스크롤+더보기 (명시적 버튼 클릭 없이 로딩 유도)
+        try:
+            for _ in range(10):
+                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                await page.wait_for_timeout(800)
+        except Exception:
+            pass
+
+        # JSON에서 추출
+        names = extract_brands_from_json(json_payloads)
+
+        # 부족하면 HTML 백업 파싱
+        if len(names) < 50:
+            try:
+                html2 = await page.content()
+                names = unique_keep_order(names + extract_brands_from_html(html2))[:100]
+            except Exception:
+                pass
+
+        await context.close()
+        await browser.close()
+        return names
+
+def extract_brands_from_json(json_objs) -> list[str]:
+    names = []
+    def walk(node):
+        if isinstance(node, dict):
+            bi = node.get("brandsInfo") or node.get("brandInfo")
+            if isinstance(bi, dict):
+                nm = (
+                    bi.get("brandName") or bi.get("brandNm")
+                    or bi.get("brandKrName") or bi.get("brand_kor_name")
+                )
+                nm = normalize_brand_text(nm)
+                if nm:
+                    names.append(nm)
+            for v in node.values():
+                if isinstance(v, (dict, list)):
+                    walk(v)
+        elif isinstance(node, list):
+            for it in node:
+                walk(it)
+    for jo in json_objs:
+        try:
+            walk(jo)
+        except Exception:
+            pass
+    return unique_keep_order(names)[:100]
+
+# =========================
+# 엑셀 (월 시트 자동)
+# =========================
+def month_sheet_name(dt: datetime) -> str:
+    return f"{dt.strftime('%y')}년 {dt.month}월"
+
+def ensure_month_sheet(wb, dt: datetime):
+    name = month_sheet_name(dt)
+    if name in wb.sheetnames:
+        ws = wb[name]
+    else:
+        ws = wb.create_sheet(title=name)
+        setup_layout(ws, dt)
+    return ws
+
+def setup_layout(ws, dt: datetime):
+    last_day = monthrange(dt.year, dt.month)[1]
+    ws["A1"] = "브랜드 순위 (올리브영 앱 기준)"
+    ws["A1"].font = Font(bold=True, size=12)
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=1 + last_day)
+
+    ws["A2"] = "일자"
+    for d in range(1, last_day + 1):
+        ws.cell(row=2, column=1 + d).value = f"{d}일"
+
+    ws["A3"] = "요일"
+    for d in range(1, last_day + 1):
+        wd = date(dt.year, dt.month, d).weekday()
+        ws.cell(row=3, column=1 + d).value = ["월","화","수","목","금","토","일"][wd]
+
+    ws["A4"] = "비고"
+    for r in range(1, 101):
+        ws.cell(row=4 + r, column=1).value = r
+
+    for r in range(1, 5 + 100):
+        for c in range(1, 1 + last_day + 1):
+            ws.cell(row=r, column=c).alignment = Alignment(vertical="center")
+    ws.column_dimensions["A"].width = 8
+    for d in range(1, last_day + 1):
+        ws.column_dimensions[get_column_letter(1 + d)].width = 18
+
+def write_today(ws, now: datetime, brands):
+    col = 1 + now.day
+    for i in range(100):
+        ws.cell(row=5 + i, column=col).value = brands[i] if i < len(brands) else None
+
+def read_rank_map(ws, day: int):
+    col = 1 + day
+    ranks = {}
+    for i in range(100):
+        name = ws.cell(row=5 + i, column=col).value
+        if name:
+            ranks[str(name).strip()] = i + 1
+    return ranks
+
+def get_yesterday_rank_map(wb, now: datetime):
+    y = now - timedelta(days=1)
+    sn = month_sheet_name(y)
+    if sn in wb.sheetnames:
+        try:
+            return read_rank_map(wb[sn], y.day)
+        except Exception:
+            pass
+    return {}
+
+def save_excel_and_get_yesterday_map(brands):
+    now = datetime.now(KST)
+    if os.path.exists(OUTPUT_PATH):
+        wb = load_workbook(OUTPUT_PATH)
+    else:
+        wb = Workbook()
+        if "Sheet" in wb.sheetnames and len(wb.sheetnames) == 1:
+            wb.remove(wb["Sheet"])
+    ws = ensure_month_sheet(wb, now)
+    if ws.cell(row=2, column=2).value is None:
+        setup_layout(ws, now)
+    ymap = get_yesterday_rank_map(wb, now)
+    write_today(ws, now, brands)
+    wb.save(OUTPUT_PATH)
+    return ymap, now
+
+# =========================
+# Slack
+# =========================
+def build_delta(today_rank, yesterday_rank):
+    if yesterday_rank is None:
+        return "(new)"
+    diff = yesterday_rank - today_rank
+    return f"(↑{diff})" if diff > 0 else (f"(↓{abs(diff)})" if diff < 0 else "(-)")
+
+def post_slack_top10(brands, ymap, now):
+    if not SLACK_WEBHOOK_URL:
+        return
+    if not brands:
+        payload = {"text": f"❗ 수집 실패 — {now.strftime('%Y-%m-%d')} (KST) / 디버그 아티팩트를 확인하세요."}
+        try:
+            requests.post(SLACK_WEBHOOK_URL, data=json.dumps(payload),
+                          headers={"Content-Type":"application/json"}, timeout=10)
+        except Exception:
+            pass
+        return
+
+    top10 = brands[:10]
+    lines = []
+    for idx, nm in enumerate(top10, start=1):
+        delta = build_delta(idx, ymap.get(nm))
+        lines.append(f"{idx}. {delta} {nm}")
+    title = f"📊 올리브영 데일리 브랜드 랭킹 Top10 — {now.strftime('%Y-%m-%d')} (KST)"
+    payload = {
+        "blocks": [
+            {"type": "header", "text": {"type":"plain_text","text":title,"emoji":True}},
+            {"type": "section", "text": {"type":"mrkdwn","text":"\n".join(lines)}},
+        ]
+    }
     try:
-        creds = UserCredentials(None, refresh_token=GOOGLE_REFRESH_TOKEN, client_id=GOOGLE_CLIENT_ID, client_secret=GOOGLE_CLIENT_SECRET, token_uri="https://oauth2.googleapis.com/token", scopes=["https://www.googleapis.com/auth/drive.file"])
-        creds.refresh(GoogleRequest()); return build("drive", "v3", credentials=creds, cache_discovery=False)
-    except Exception as e: logging.exception("OAuth Drive service 생성 실패: %s", e); return None
+        requests.post(SLACK_WEBHOOK_URL, data=json.dumps(payload),
+                      headers={"Content-Type":"application/json"}, timeout=10)
+    except Exception:
+        pass
 
-def upload_csv_to_drive(service, csv_bytes, filename, folder_id=None):
-    if not service: return None
+# =========================
+# Google Drive 업로드(선택)
+# =========================
+def build_drive_service():
+    if not (GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and GOOGLE_REFRESH_TOKEN and GDRIVE_FOLDER_ID):
+        return None
     try:
-        media = MediaIoBaseUpload(BytesIO(csv_bytes), mimetype="text/csv", resumable=False); body = {"name": filename}
-        if folder_id: body["parents"] = [folder_id]
-        f = service.files().create(body=body, media_body=media, fields="id,webViewLink,name").execute()
-        logging.info("Uploaded to Drive: id=%s name=%s link=%s", f.get("id"), f.get("name"), f.get("webViewLink")); return f
-    except Exception as e: logging.exception("Drive upload 실패: %s", e); return None
+        creds = Credentials(
+            token=None,
+            refresh_token=GOOGLE_REFRESH_TOKEN,
+            token_uri="https://oauth2.googleapis.com/token",
+            client_id=GOOGLE_CLIENT_ID,
+            client_secret=GOOGLE_CLIENT_SECRET,
+            scopes=["https://www.googleapis.com/auth/drive.file"],
+        )
+        return build("drive", "v3", credentials=creds)
+    except Exception as e:
+        print(f"[드라이브] 서비스 생성 실패: {e}")
+        return None
 
-def find_csv_by_exact_name(service, folder_id: str, filename: str):
+def find_file_in_folder(service, folder_id, name):
+    q = f"name = '{name}' and '{folder_id}' in parents and trashed=false"
+    res = service.files().list(q=q, fields="files(id,name)", pageSize=1).execute()
+    files = res.get("files", [])
+    return files[0]["id"] if files else None
+
+def upload_or_update_to_drive(filepath, folder_id):
+    service = build_drive_service()
+    if not service:
+        return
     try:
-        q = f"name='{filename}' and '{folder_id}' in parents and mimeType='text/csv'"
-        res = service.files().list(q=q, pageSize=1, fields="files(id,name,createdTime)").execute()
-        return res.get("files", [])[0] if res.get("files") else None
-    except Exception as e: logging.exception("find_csv_by_exact_name error: %s", e); return None
-        
-def download_file_from_drive(service, file_id):
-    try:
-        request = service.files().get_media(fileId=file_id); fh = BytesIO()
-        downloader = MediaIoBaseDownload(fh, request); done = False
-        while not done: status, done = downloader.next_chunk()
-        fh.seek(0); return fh.read().decode("utf-8")
-    except Exception as e: logging.exception("download_file_from_drive error: %s", e); return None
+        file_id = find_file_in_folder(service, folder_id, os.path.basename(filepath))
+        media = MediaFileUpload(
+            filepath,
+            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            resumable=True,
+        )
+        if file_id:
+            service.files().update(fileId=file_id, media_body=media).execute()
+            print(f"[드라이브] 기존 파일 갱신 완료")
+        else:
+            meta = {"name": os.path.basename(filepath), "parents": [folder_id]}
+            service.files().create(body=meta, media_body=media, fields="id").execute()
+            print(f"[드라이브] 새 파일 업로드 완료")
+    except Exception as e:
+        print(f"[드라이브] 업로드 실패: {e}")
 
-def analyze_brand_trends(today_items, prev_items, top_window=TOP_WINDOW):
-    prev_map = {p.get("brand_name"): p.get("rank") for p in (prev_items or [])}
-    prev_top_brands = {p.get("brand_name") for p in (prev_items or []) if p.get("rank") and p.get("rank") <= top_window}
-    trends = []; up, down, ins, out = [], [], [], []
-    for it in today_items:
-        brand = it["brand_name"]; prev_rank = prev_map.get(brand)
-        if prev_rank: movers.append({"brand_name": brand, "rank": it['rank'], "prev_rank": prev_rank, "change": prev_rank - it['rank']})
-        elif it['rank'] <= top_window: ins.append({"brand_name": brand, "rank": it['rank']})
-    today_brands = {t["brand_name"] for t in today_items}
-    out_brands = [p for p in (prev_items or []) if p.get("brand_name") in (prev_top_brands - today_brands)]
-    up = sorted([m for m in movers if m["change"] > 0], key=lambda x: x["change"], reverse=True)
-    down = sorted([m for m in movers if m["change"] < 0], key=lambda x: x["change"])
-    return up, down, ins, out, len(ins) + len(out)
+# =========================
+# main
+# =========================
+async def run():
+    brands = []
 
-def send_slack_text(text):
-    if not SLACK_WEBHOOK: logging.warning("No SLACK_WEBHOOK configured."); return False
-    try: res = requests.post(SLACK_WEBHOOK, json={"text": text}, timeout=10); return res.ok
-    except Exception: return False
+    # 1) Realtime API (권장 경로)
+    html = fetch_html_via_oxylabs(URL)
+    if html:
+        with open(os.path.join(OUTPUT_DIR, "brand_debug.html"), "w", encoding="utf-8") as f:
+            f.write(html[:200000])
+        brands = extract_brands_from_html(html)
 
-# ---------------- 메인
-def main():
-    now_kst = kst_now()
-    today_kst = now_kst.date()
-    yesterday_kst = (now_kst - timedelta(days=1)).date()
-    logging.info("Build: oy-brand-rank-app %s", today_kst.isoformat())
+    # 2) 폴백: Web Unblocker 프록시 + Playwright
+    if not brands and PROXY_SERVER:
+        print("[info] Realtime 실패 또는 미설정 — 프록시 폴백 시도")
+        try:
+            brands = await fetch_brands_via_playwright(URL, PROXY_SERVER)
+        except Exception as e:
+            print(f"[Playwright] 폴백 실패: {e}")
 
-    # --- 크롤링 로직: Playwright-Stealth를 기본으로 사용 ---
-    items, sample = crawl_with_playwright()
-
-    if not items:
-        logging.error("Scraping failed completely. sample head: %s", (sample or "")[:500])
-        send_slack_text(f"❌ OliveYoung Mobile Brand Ranking scraping failed.\nLast message: {(sample or '')[:800]}")
-        return 1
-    
-    # --- CSV 생성 및 업로드 ---
-    os.makedirs(OUT_DIR, exist_ok=True)
-    fname_today = f"올리브영_브랜드랭킹_{today_kst.isoformat()}.csv"
-    header = ["rank", "brand_name", "representative_product", "url"]
-    def q(s):
-        if s is None: return ""
-        s = str(s).replace('"', '""'); return f'"{s}"' if any(c in s for c in [',', '\n', '"']) else s
-    lines = [",".join(header)]
-    for it in items: lines.append(",".join([q(it.get(h)) for h in header]))
-    csv_data = "\n".join(lines).encode("utf-8")
-    with open(os.path.join(OUT_DIR, fname_today), "wb") as f: f.write(csv_data)
-    logging.info("Saved CSV locally.")
-
-    drive_service = build_drive_service_oauth()
-    if drive_service and GDRIVE_FOLDER_ID:
-        upload_csv_to_drive(drive_service, csv_data, fname_today, folder_id=GDRIVE_FOLDER_ID)
-    
-    # --- 전일 데이터 로드 및 분석 ---
-    prev_items = []
-    if drive_service and GDRIVE_FOLDER_ID:
-        fname_yesterday = f"올리브영_브랜드랭킹_{yesterday_kst.isoformat()}.csv"
-        y_file = find_csv_by_exact_name(drive_service, GDRIVE_FOLDER_ID, fname_yesterday)
-        if y_file:
-            prev_csv_text = download_file_from_drive(drive_service, y_file.get("id"))
-            if prev_csv_text:
-                try:
-                    import csv
-                    sio = StringIO(prev_csv_text)
-                    rdr = csv.DictReader(sio)
-                    for r in rdr:
-                        try: r['rank'] = int(r.get('rank', 0)); prev_items.append(r)
-                        except (ValueError, TypeError): continue
-                except Exception: pass
-    
-    up, down, chart_ins, rank_out, in_out_count = analyze_brand_trends(items, prev_items, TOP_WINDOW)
-
-    # --- Slack 메시지 구성 ---
-    title = f"*올리브영 모바일 브랜드 랭킹 100* ({now_kst.strftime('%Y-%m-%d %H:%M KST')})"
-    out_lines = [title]
-    out_lines.append("\n*🏆 TOP 10 브랜드*")
-    for it in items[:10]: out_lines.append(f"{it.get('rank')}. <{it.get('url')}|{it.get('brand_name')}>")
-    def fmt_brand_move(brand, prev, cur): return f"- {brand} {prev}위 → {cur}위 ({'↑' if prev > cur else '↓'}{abs(prev - cur)})"
-    out_lines.append("\n*🔥 급상승*"); [out_lines.append(fmt_brand_move(m["brand_name"], m["prev_rank"], m["rank"])) for m in up[:3]]
-    out_lines.append("\n*🆕 뉴랭커*"); [out_lines.append(f"- {t['brand_name']} NEW → {t['rank']}위") for t in chart_ins[:3]]
-    out_lines.append("\n*📉 급하락 & 랭크아웃*"); [out_lines.append(fmt_brand_move(m["brand_name"], m["prev_rank"], m["rank"])) for m in down[:3]]
-    [out_lines.append(f"- {ro['brand_name']} {ro['rank']}위 → OUT") for ro in rank_out[:2]]
-    out_lines.append(f"\n*↔ 랭크 인&아웃*: {in_out_count}개 브랜드 변동")
-
-    send_slack_text("\n".join(out_lines))
-    logging.info("Done.")
-    return 0
+    # 결과 처리
+    now = datetime.now(KST)
+    ymap, now = save_excel_and_get_yesterday_map(brands)
+    post_slack_top10(brands, ymap, now)
+    upload_or_update_to_drive(OUTPUT_PATH, GDRIVE_FOLDER_ID)
 
 if __name__ == "__main__":
-    exit(main())
+    asyncio.run(run())
