@@ -1,5 +1,10 @@
 # -*- coding: utf-8 -*-
-# 올리브영 모바일 '브랜드 랭킹' Top100 수집 → 월별 시트 Excel 저장 → Google Drive 업로드 → Slack 알림(아마존 스타일)
+# 올리브영 모바일 '브랜드 랭킹' Top100 수집 -> 월별 시트 Excel 저장 -> Google Drive 업로드 -> Slack 알림(아마존 스타일)
+# - 월 바뀌면 같은 파일 내 새 시트("25년 9월"), 연도 바뀌면 새 파일("올리브영_브랜드_랭킹_YYYY.xlsx")
+# - TOP10: 전일 대비 변동(↑n/↓n/—/NEW)
+# - 급상승/급하락: ±10계단 이상(각 최대 5개)
+# - 랭크 아웃: 전일 Top70 → 금일 Top100 제외(최대 5개)
+# - 실패 시 Slack 공지 후 Exit 0 (원하면 1로 바꿔도 됨)
 
 import os, io, re, logging
 from datetime import datetime, timedelta, timezone
@@ -17,13 +22,14 @@ from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
 from google.oauth2.credentials import Credentials as UserCredentials
 from google.auth.transport.requests import Request as GoogleRequest
 
-# Playwright + stealth
+# Playwright 강제 사용 (stealth는 있으면 사용)
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 try:
-    from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
     from playwright_stealth import stealth_sync
-    PW_OK = True
-except Exception:
-    PW_OK = False
+    STEALTH_OK = True
+except Exception as e:
+    STEALTH_OK = False
+    logging.warning("playwright_stealth 임포트 실패: %s (stealth 없이 진행)", e)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 
@@ -36,6 +42,7 @@ GDRIVE_FOLDER_ID = os.environ.get("GDRIVE_FOLDER_ID", "").strip()
 TARGET_URL = "https://m.oliveyoung.co.kr/m/mtn?menu=ranking&tab=brands"
 OUT_DIR = "out"
 
+# ---------------- 공통 ----------------
 def kst_now():
     return datetime.now(timezone.utc) + timedelta(hours=9)
 
@@ -55,13 +62,15 @@ def make_session_mobile():
     return s
 
 def send_slack(text: str):
-    if not SLACK_WEBHOOK: return
+    if not SLACK_WEBHOOK:
+        logging.warning("SLACK_WEBHOOK_URL 미설정")
+        return
     try:
         requests.post(SLACK_WEBHOOK, json={"text": text}, timeout=10)
     except Exception:
         logging.exception("Slack 전송 실패")
 
-# -------- Drive --------
+# ---------------- Drive ----------------
 def drive_service():
     try:
         creds = UserCredentials(
@@ -75,51 +84,59 @@ def drive_service():
         creds.refresh(GoogleRequest())
         return build("drive", "v3", credentials=creds, cache_discovery=False)
     except Exception:
-        logging.exception("Drive 초기화 실패"); return None
+        logging.exception("Drive 초기화 실패")
+        return None
 
-def drive_find(svc, folder_id, name):
+def drive_find(service, folder_id, name):
     try:
         q = f"name='{name}' and mimeType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'"
-        if folder_id: q += f" and '{folder_id}' in parents"
-        r = svc.files().list(q=q, pageSize=1, fields="files(id,name)").execute()
+        if folder_id:
+            q += f" and '{folder_id}' in parents"
+        r = service.files().list(q=q, pageSize=1, fields="files(id,name)").execute()
         fs = r.get("files", [])
         return fs[0] if fs else None
     except Exception:
-        logging.exception("Drive find 실패"); return None
+        logging.exception("Drive find 실패")
+        return None
 
-def drive_download(svc, file_id):
+def drive_download(service, file_id):
     try:
-        req = svc.files().get_media(fileId=file_id)
+        req = service.files().get_media(fileId=file_id)
         buf = io.BytesIO()
         dl = MediaIoBaseDownload(buf, req)
         done = False
         while not done:
             _, done = dl.next_chunk()
-        buf.seek(0); return buf.read()
+        buf.seek(0)
+        return buf.read()
     except Exception:
-        logging.exception("Drive 다운로드 실패"); return None
+        logging.exception("Drive 다운로드 실패")
+        return None
 
-def drive_upload_new(svc, folder_id, filename, data: bytes):
+def drive_upload_new(service, folder_id, filename, data: bytes):
     try:
         media = MediaIoBaseUpload(io.BytesIO(data),
                                   mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                                   resumable=False)
         body = {"name": filename}
-        if folder_id: body["parents"] = [folder_id]
-        return svc.files().create(body=body, media_body=media, fields="id,webViewLink").execute()
+        if folder_id:
+            body["parents"] = [folder_id]
+        return service.files().create(body=body, media_body=media, fields="id,webViewLink").execute()
     except Exception:
-        logging.exception("Drive 업로드 실패"); return None
+        logging.exception("Drive 업로드 실패")
+        return None
 
-def drive_update(svc, file_id, data: bytes):
+def drive_update(service, file_id, data: bytes):
     try:
         media = MediaIoBaseUpload(io.BytesIO(data),
                                   mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                                   resumable=False)
-        return svc.files().update(fileId=file_id, media_body=media).execute()
+        return service.files().update(fileId=file_id, media_body=media).execute()
     except Exception:
-        logging.exception("Drive 업데이트 실패"); return None
+        logging.exception("Drive 업데이트 실패")
+        return None
 
-# -------- 수집 --------
+# ---------------- 수집 ----------------
 _RANK_PAT = re.compile(r"(^|\s)(\d{1,3})\s*위(?![^\n]*OUT)", re.M)
 _BAD = set(["브랜드","더보기","장바구니","로그인","고객센터","대표전화","채팅","사업자","개인정보",
             "청소년","법적고지","인스타그램","페이스북","유튜브","카카오톡","이용약관",
@@ -157,6 +174,7 @@ def _extract_from_li(li):
         return None, None
 
 def sniff_brands_from_network(page, timeout_ms=5000):
+    """XHR/Fetch JSON 응답에서 brand(rank) 추출"""
     found = []
     def handler(resp):
         try:
@@ -188,10 +206,10 @@ def sniff_brands_from_network(page, timeout_ms=5000):
     return out
 
 def try_playwright(max_items=100):
-    if not PW_OK: return None
     try:
         with sync_playwright() as p:
             for which in ("chromium","webkit"):
+                logging.info("Playwright 시도: %s", which)
                 browser = None
                 try:
                     if which == "chromium":
@@ -202,30 +220,32 @@ def try_playwright(max_items=100):
                         device = p.devices.get("iPhone 12") or {}
                     context = browser.new_context(**device, locale="ko-KR")
                     page = context.new_page()
-                    stealth_sync(page)  # 차단 완화
+                    if STEALTH_OK:
+                        stealth_sync(page)
                     page.goto(TARGET_URL, wait_until="networkidle", timeout=60000)
 
-                    # 상단 쿠폰/팝업 닫기 시도
+                    # 팝업/배너 닫기 시도
                     for sel in ["button[aria-label*='닫기']", "button.close", "div[role='dialog'] button", "button:has-text('닫기')"]:
                         try: page.locator(sel).first.click(timeout=1000)
                         except Exception: pass
 
-                    # '브랜드 랭킹' 탭 클릭 (URL 파라미터가 있어도 실제 클릭해야 XHR 뜨는 경우 대응)
+                    # '브랜드 랭킹' 탭 클릭(실제 탭 전환을 트리거)
                     try:
                         page.get_by_text("브랜드 랭킹", exact=False).first.click(timeout=2000)
                         page.wait_for_load_state("networkidle", timeout=10000)
                     except Exception:
                         pass
 
-                    # 스크롤 로딩
+                    # 지연 로딩 대비 스크롤
                     for _ in range(6):
                         page.evaluate("window.scrollBy(0, document.body.scrollHeight)")
                         page.wait_for_timeout(350)
 
+                    # 1) 네트워크 JSON 스니핑
                     names = sniff_brands_from_network(page, 5000)
 
+                    # 2) DOM 보조 추출
                     if len(names) < 20:
-                        # DOM 보조 추출
                         items = []
                         for c in page.query_selector_all("main, section, div, ul, ol"):
                             try:
@@ -261,15 +281,18 @@ def try_requests_html(max_items=100):
         s = make_session_mobile()
         r = s.get(TARGET_URL, timeout=15)
         if r.status_code == 403:
-            logging.warning("Requests 단계 403 차단"); return None
+            logging.warning("Requests 단계 403 차단")
+            return None
         r.raise_for_status()
         html = r.text
         pairs = []
+        # 임베디드 JSON 힌트
         for mm in re.finditer(r'"(brandNm|brandName|name)"\s*:\s*"([^"]+)"\s*,\s*"(rank|rk|ord)"\s*:\s*"?(\\d{1,3})"?', html):
             try:
                 nm = mm.group(2); rk = int(mm.group(4))
                 if 1 <= rk <= 100 and is_brand_like(nm): pairs.append((rk, nm.strip()))
-            except Exception: pass
+            except Exception:
+                pass
         if not pairs:
             soup = BeautifulSoup(html, "html.parser")
             for line in soup.get_text("\n", strip=True).split("\n"):
@@ -286,7 +309,8 @@ def try_requests_html(max_items=100):
         out = [x for x in out if x]
         return out[:max_items] if out else None
     except Exception:
-        logging.exception("Requests/HTML 단계 실패"); return None
+        logging.exception("Requests/HTML 단계 실패")
+        return None
 
 def scrape_top100():
     out = try_playwright()
@@ -295,7 +319,7 @@ def scrape_top100():
     if out and len(out) >= 20: return out[:100]
     return []
 
-# -------- 엑셀 --------
+# ---------------- 엑셀 ----------------
 def month_sheet(dt): return f"{dt.year%100}년 {dt.month}월"
 def file_name(dt): return f"올리브영_브랜드_랭킹_{dt.year}.xlsx"
 
@@ -303,13 +327,15 @@ def ensure_header(ws):
     if ws.max_row == 1 and ws.max_column == 1 and ws["A1"].value is None:
         ws.append(["날짜"] + [f"{i}위" for i in range(1, 101)])
         ws.column_dimensions["A"].width = 14
-        for c in range(2, 102): ws.column_dimensions[get_column_letter(c)].width = 12
+        for c in range(2, 102):
+            ws.column_dimensions[get_column_letter(c)].width = 12
 
 def write_today(ws, dt, brands):
     d = dt.date().isoformat()
     row = None
     for r in range(2, ws.max_row + 1):
-        if str(ws.cell(r, 1).value) == d: row = r; break
+        if str(ws.cell(r, 1).value) == d:
+            row = r; break
     if row is None: row = ws.max_row + 1
     ws.cell(row=row, column=1, value=d)
     for i in range(100):
@@ -328,16 +354,18 @@ def read_prev_map(wb, now_dt):
         ws = wb[cur]
         for r in range(2, ws.max_row + 1):
             d = str(ws.cell(r, 1).value)
-            if d and d < now_dt.date().isoformat(): cand.append((ws, r))
+            if d and d < now_dt.date().isoformat():
+                cand.append((ws, r))
     prev_m = (now_dt.replace(day=1) - timedelta(days=1))
     prev_name = month_sheet(prev_m)
     if prev_name in wb.sheetnames:
         ws2 = wb[prev_name]
         if ws2.max_row >= 2: cand.append((ws2, ws2.max_row))
     if not cand: return {}
-    ws, r = cand[-1]; return row_to_map(ws, r)
+    ws, r = cand[-1]
+    return row_to_map(ws, r)
 
-# -------- Slack 포맷(아마존 스타일) --------
+# ---------------- Slack 포맷 ----------------
 def delta_str(today_rank, prev_rank):
     if prev_rank is None: return "NEW"
     diff = prev_rank - today_rank
@@ -347,7 +375,9 @@ def delta_str(today_rank, prev_rank):
 
 def build_sections(today_list, prev_map):
     today_map = {b: i+1 for i, b in enumerate(today_list)}
+    # TOP10
     top10 = [f"{i+1}. ({delta_str(i+1, prev_map.get(b))}) {b}" for i, b in enumerate(today_list[:10])]
+    # 급상승/급하락
     ups, downs = [], []
     for b, tr in today_map.items():
         pr = prev_map.get(b)
@@ -358,30 +388,35 @@ def build_sections(today_list, prev_map):
     ups.sort(key=lambda x: (-x[0], x[3])); downs.sort(key=lambda x: (-x[0], x[3]))
     ups_lines = [f"- {b} {pr}위 → {tr}위 (↑{d})" for d, b, pr, tr in ups[:5]]
     downs_lines = [f"- {b} {pr}위 → {tr}위 (↓{d})" for d, b, pr, tr in downs[:5]]
+    # 뉴브랜드 (오늘 Top100에 새로 등장)
     newins = [b for b in today_list if b not in prev_map][:5]
     newins_lines = [f"- {b} NEW → {today_map[b]}위" for b in newins]
+    # 랭크 아웃 (전일 ≤70)
     prev_top70 = [(b, r) for b, r in prev_map.items() if r <= 70]
     outs = []
     today_set = set(today_list)
     for b, r in sorted(prev_top70, key=lambda x: x[1]):
-        if b not in today_set: outs.append((b, r))
+        if b not in today_set:
+            outs.append((b, r))
     outs_lines = [f"- {b} {r}위 → OUT" for b, r in outs[:5]]
     inout_summary = f"{len(newins)}개 IN, {len(outs)}개 OUT"
     return top10, ups_lines, newins_lines, downs_lines, outs_lines, inout_summary
 
-# -------- 메인 --------
+# ---------------- 메인 ----------------
 def main():
     now = kst_now()
     logging.info("브랜드 랭킹 수집 시작")
+    logging.info("Playwright 사용 강제 / stealth: %s", STEALTH_OK)
 
     try:
         brands = scrape_top100()
     except Exception:
-        logging.exception("scrape_top100 예외"); brands = []
+        logging.exception("scrape_top100 예외")
+        brands = []
 
     if len(brands) < 20:
         send_slack("❌ *올리브영 모바일 브랜드 랭킹* 수집 실패 (차단/로딩 실패). 브라우저 설치 및 차단 정책 확인 필요.")
-        return 0  # 실패시에도 워크플로우 성공 처리
+        return 0  # 실패 시에도 워크플로우는 성공 처리
 
     svc = drive_service()
     fname = file_name(now)
@@ -434,7 +469,8 @@ def main():
     ]
     if view_link: msg.append(f"\n<{view_link}|Google Drive에서 열기>")
     send_slack("\n".join(msg))
-    logging.info("완료"); return 0
+    logging.info("완료")
+    return 0
 
 if __name__ == "__main__":
     raise SystemExit(main())
