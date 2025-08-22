@@ -3,7 +3,7 @@ name: oliveyoung-mobile-brand-ranking
 on:
   workflow_dispatch:
   schedule:
-    # 매일 한국시간 09:10에 실행 (UTC 기준 00:10)
+    # 한국시간 09:10 (UTC 00:10)
     - cron: "10 0 * * *"
 
 jobs:
@@ -23,7 +23,8 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install requests beautifulsoup4 openpyxl google-api-python-client google-auth google-auth-httplib2 google-auth-oauthlib playwright
-          python -m playwright install --with-deps chromium
+          # 브라우저 전부 설치(특히 webkit)
+          python -m playwright install --with-deps chromium webkit
 
       - name: Run crawler
         env:
