@@ -72,7 +72,7 @@ def extract_key(src:str, row, url:str|None):
             if c in row and pd.notna(row[c]): return str(row[c]).strip()
         m = re.search(r'product_code=([0-9A-Za-z\-]+)', u)
         if m: return m.group(1)
-        m2 = re.search(r'/(\d{6,})', u)  # URL 말단 숫자
+        m2 = re.search(r'/(\d{6,})', u)
         return m2.group(1) if m2 else None
     if src == 'daiso_kr':
         for c in COLS['pdNo']:
