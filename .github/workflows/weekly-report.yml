@@ -1,0 +1,64 @@
+name: Weekly report
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    # 매주 일요일 18:00 KST = 09:00 UTC
+    - cron: "0 9 * * 0"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: weekly-report
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas
+
+      # (선택) 구글드라이브에서 CSV 내려받기
+      # 이미 레포에 CSV가 있다면 이 스텝은 지우셔도 됩니다.
+      # rclone을 쓰거나, 기존에 쓰시던 다운로드 스크립트를 호출하세요.
+      # - name: Sync daily CSVs from Google Drive
+      #   run: |
+      #     mkdir -p data/daily
+      #     # 예: rclone 사용 (사전 rclone.conf는 Secrets에 저장 후 내려받아야 함)
+      #     # rclone copy "drive:YOUR/FOLDER" data/daily --create-empty-src-dirs
+
+      - name: Quick scan (optional)
+        env:
+          DATA_DIR: ./data/daily   # 일간 CSV가 모여있는 루트 폴더
+        run: |
+          python scripts/check_daily_scan.py || true
+
+      - name: Run weekly report
+        env:
+          DATA_DIR: ./data/daily
+          MIN_DAYS: 1   # 첫 실행/테스트는 1로. 정상 확인 후 3으로 올리세요.
+        run: |
+          python scripts/weekly_report_v2.py | tee weekly_summary.json
+          echo "=== Weekly summary saved to weekly_summary.json ==="
+
+      # (선택) 슬랙 웹훅으로 전송 - 이미 웹훅 시크릿이 있다고 하셨죠.
+      - name: Post to Slack (optional)
+        if: always()
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          payload=$(jq -Rs '{text: .}' < weekly_summary.json)
+          curl -s -X POST -H 'Content-type: application/json' \
+            --data "${payload}" "$SLACK_WEBHOOK_URL" || true
