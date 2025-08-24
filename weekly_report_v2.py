@@ -1,8 +1,8 @@
-# weekly_report_v2.py
+# scripts/weekly_report_v2.py
 # -*- coding: utf-8 -*-
 import os, re, glob, json
 import pandas as pd
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta, timezone
 
 KST = timezone(timedelta(hours=9))
 
@@ -15,17 +15,12 @@ SRC_INFO = {
 }
 ALL_SRCS = list(SRC_INFO.keys())
 
-# 한글/영문 컬럼 동의어
 COLS = {
     'rank':        ['rank','순위','ranking','랭킹'],
     'product':     ['product','제품명','name','상품명','title'],
     'brand':       ['brand','브랜드'],
     'url':         ['url','링크','product_url','link'],
     'date':        ['date','날짜','수집일','crawl_date'],
-    'price':       ['price','가격','sale_price'],
-    'orig_price':  ['orig_price','정가','original_price','소비자가'],
-    'discount':    ['discount_rate','할인율','discount'],
-    # ID 후보
     'goodsNo':     ['goodsNo','goods_no','goodsno','상품번호','상품코드'],
     'productId':   ['productId','product_id','prdtNo','상품ID','상품아이디','상품코드'],
     'asin':        ['asin','ASIN'],
@@ -61,22 +56,17 @@ def read_csv_any(path:str)->pd.DataFrame:
 def extract_key(src:str, row, url:str|None):
     u = str(url or "")
     if src == 'oy_kor':
-        # goodsNo 우선 → URL goodsNo
         for c in COLS['goodsNo']:
             if c in row and pd.notna(row[c]): return str(row[c]).strip()
-        m = re.search(r'goodsNo=([0-9A-Za-z\-]+)', u)
-        return m.group(1) if m else None
+        m = re.search(r'goodsNo=([0-9A-Za-z\-]+)', u);  return m.group(1) if m else None
     if src == 'oy_global':
-        # productId/prdtNo → URL productId/prdtNo
         for c in COLS['productId']:
             if c in row and pd.notna(row[c]): return str(row[c]).strip()
-        m = re.search(r'(?:productId|prdtNo)=([0-9A-Za-z\-]+)', u)
-        return m.group(1) if m else None
+        m = re.search(r'(?:productId|prdtNo)=([0-9A-Za-z\-]+)', u); return m.group(1) if m else None
     if src == 'amazon_us':
         for c in COLS['asin']:
             if c in row and pd.notna(row[c]): return str(row[c]).strip().upper()
-        m = re.search(r'/([A-Z0-9]{10})(?:[/?#]|$)', u.upper())
-        return m.group(1) if m else None
+        m = re.search(r'/([A-Z0-9]{10})(?:[/?#]|$)', u.upper()); return m.group(1) if m else None
     if src == 'qoo10_jp':
         for c in COLS['product_code']:
             if c in row and pd.notna(row[c]): return str(row[c]).strip()
@@ -87,8 +77,7 @@ def extract_key(src:str, row, url:str|None):
     if src == 'daiso_kr':
         for c in COLS['pdNo']:
             if c in row and pd.notna(row[c]): return str(row[c]).strip()
-        m = re.search(r'pdNo=([0-9A-Za-z\-]+)', u)
-        return m.group(1) if m else None
+        m = re.search(r'pdNo=([0-9A-Za-z\-]+)', u); return m.group(1) if m else None
     return None
 
 def load_unified(data_dir:str)->pd.DataFrame:
@@ -102,22 +91,17 @@ def load_unified(data_dir:str)->pd.DataFrame:
             df = read_csv_any(p)
         except Exception:
             continue
-
-        # 날짜
         date_col = pick(df, COLS['date'])
         if date_col:
             dates = pd.to_datetime(df[date_col], errors='coerce')
         else:
             dates = pd.Series([infer_date_from_filename(p)]*len(df))
-
         rank_col = pick(df, COLS['rank'])
         if not rank_col: 
             continue
-
         prod_col = pick(df, COLS['product'])
         brand_col = pick(df, COLS['brand'])
         url_col   = pick(df, COLS['url'])
-
         for i, r in df.iterrows():
             rec = {
                 'source': src,
@@ -129,7 +113,6 @@ def load_unified(data_dir:str)->pd.DataFrame:
             }
             rec['key'] = extract_key(src, r, rec['url'])
             rows.append(rec)
-
     ud = pd.DataFrame(rows, columns=['source','date','rank','product','brand','url','key'])
     ud = ud.dropna(subset=['source','date','rank','key'])
     return ud
@@ -138,8 +121,8 @@ def week_range_for_source(ud:pd.DataFrame, src:str):
     dts = ud.loc[ud['source'].eq(src), 'date']
     if dts.empty: return None
     last = pd.to_datetime(dts.max())
-    end = last + pd.Timedelta(days=(6 - last.weekday()))  # 해당 주의 일요일
-    start = end - pd.Timedelta(days=6)                    # 월요일
+    end = last + pd.Timedelta(days=(6 - last.weekday()))
+    start = end - pd.Timedelta(days=6)
     return start.normalize(), end.normalize()
 
 def aggregate_source(ud:pd.DataFrame, src:str, min_days:int)->dict:
@@ -152,35 +135,29 @@ def aggregate_source(ud:pd.DataFrame, src:str, min_days:int)->dict:
     if d.empty:
         out['range'] = f"{start.date()}~{end.date()}"
         return out
-
     agg = (d.groupby('key', as_index=False)
              .agg(mean_rank=('rank','mean'),
                   days=('rank','count')))
     agg = agg[agg['days']>=min_days].copy()
-
     latest = (d.sort_values('date')
                 .groupby('key', as_index=False)
                 .agg(product=('product','last'),
                      brand=('brand','last'),
                      url=('url','last')))
-
     top = (agg.merge(latest, on='key', how='left')
              .sort_values('mean_rank')
              .head(10))
-
     top_lines = []
     for i, r in enumerate(top.itertuples(), 1):
         nm = getattr(r,'product') or getattr(r,'key')
         url = getattr(r,'url') or ''
         if url: nm = f"<{url}|{nm}>"
         top_lines.append(f"{i}. {nm} (등장 {int(getattr(r,'days'))}일)")
-
     brand_d = d.copy()
     brand_d['brand'] = brand_d['brand'].fillna('기타')
     brand = (brand_d.groupby('brand').size()
              .sort_values(ascending=False).head(12))
     brand_lines = [f"{b} {int(c)}개" for b,c in brand.items()]
-
     out['top10_lines'] = top_lines if top_lines else ['데이터 없음']
     out['brand_lines'] = brand_lines if brand_lines else ['데이터 없음']
     out['range'] = f"{start.date()}~{end.date()}"
