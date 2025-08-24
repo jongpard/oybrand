@@ -3,8 +3,7 @@ name: Weekly report
 on:
   workflow_dispatch: {}
   schedule:
-    # 매주 일요일 18:00 KST (= 09:00 UTC)
-    - cron: "0 9 * * 0"
+    - cron: "0 9 * * 0"   # 일 18:00 KST
 
 permissions:
   contents: read
@@ -26,7 +25,11 @@ jobs:
           python -m pip install --upgrade pip
           pip install pandas requests
 
-      - name: Fetch daily CSVs from Google Drive
+      - name: List repo tree (sanity)
+        run: |
+          ls -R || true
+
+      - name: Fetch daily CSVs from Google Drive (recursive + Sheets→CSV)
         env:
           GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
           GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
@@ -45,7 +48,7 @@ jobs:
       - name: Run weekly report
         env:
           DATA_DIR: ./data/daily
-          MIN_DAYS: 1   # 첫 실행 OK 확인 후 3으로
+          MIN_DAYS: 1   # 테스트 완료 후 3으로
         run: |
           python scripts/weekly_report_v2.py | tee weekly_summary.json
           test -s weekly_summary.json || echo "{}" > weekly_summary.json
