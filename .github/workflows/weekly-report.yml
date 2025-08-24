@@ -42,7 +42,8 @@ jobs:
         env:
           DATA_DIR: ${{ env.DATA_DIR }}
         run: |
-          python scripts/weekly_report_plus.py --data-dir "$DATA_DIR" --src "${{ env.SOURCES }}" --split
+          python scripts/weekly_report_plus.py --data-dir "$DATA_DIR" --split \
+            --src oy_kor oy_global amazon_us qoo10_jp daiso_kr
 
       # ★★ 소스별 개별 슬랙 전송 ★★
       - name: Post to Slack per source
