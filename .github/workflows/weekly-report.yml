@@ -1,64 +1,73 @@
-name: Weekly report
+name: Weekly Report
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
   schedule:
-    - cron: "0 9 * * 0"   # 일 18:00 KST
+    - cron: "0 22 * * 0"    # 월요일 오전 7시 KST(= 일요일 22:00 UTC)
 
-permissions:
-  contents: read
+env:
+  PYTHON_VERSION: "3.11"
+  DATA_DIR: "./data/daily"
+  SOURCES: "oy_kor,oy_global,amazon_us,qoo10_jp,daiso_kr"
 
 jobs:
-  run:
+  weekly:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install pandas requests
+          pip install -r requirements.txt || true
+          pip install pandas numpy python-dateutil tzdata six
 
-      - name: List repo tree (sanity)
-        run: |
-          ls -R || true
-
-      - name: Fetch daily CSVs from Google Drive (recursive + Sheets→CSV)
+      # (선택) 구글드라이브에서 일일 CSV 내려받는 단계가 있으면 유지
+      - name: Fetch daily CSVs from Google Drive (optional)
         env:
-          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_ID:     ${{ secrets.GOOGLE_CLIENT_ID }}
           GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
           GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
-          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
-          DATA_DIR: ./data/daily
+          GDRIVE_FOLDER_ID:     ${{ secrets.GDRIVE_FOLDER_ID }}
         run: |
-          python scripts/fetch_from_gdrive.py
+          python scripts/fetch_from_gdrive.py || true
 
       - name: Quick scan (optional)
-        env:
-          DATA_DIR: ./data/daily
         run: |
           python scripts/check_daily_scan.py || true
 
-      - name: Run weekly report (PLUS)
+      - name: Run weekly per source (split)
         env:
-          DATA_DIR: ./data/daily
-          MIN_DAYS: 1    # 첫 실행 확인 후 3으로
+          DATA_DIR: ${{ env.DATA_DIR }}
         run: |
-          python scripts/weekly_report_plus.py | tee weekly_summary.json
-          test -s weekly_slack_message.txt || echo "주간 리포트 생성 실패(본문 없음)" > weekly_slack_message.txt
+          python scripts/weekly_report_plus.py --data-dir "$DATA_DIR" --src "${{ env.SOURCES }}" --split
 
-      - name: Post to Slack (formatted)
-        if: env.SLACK_WEBHOOK_URL != ''
+      # ★★ 소스별 개별 슬랙 전송 ★★
+      - name: Post to Slack per source
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SOURCES: ${{ env.SOURCES }}
         run: |
-          text="$(cat weekly_slack_message.txt)"
-          payload=$(jq -n --arg t "$text" '{text:$t}')
-          curl -s -X POST -H 'Content-type: application/json' \
-            --data "$payload" "$SLACK_WEBHOOK_URL" || true
+          set -e
+          IFS=',' read -ra S <<< "$SOURCES"
+          for SRC in "${S[@]}"; do
+            FILE="slack_${SRC}.txt"
+            if [[ -s "$FILE" ]]; then
+              payload=$(jq -Rs --arg t "$(cat "$FILE")" '{text:$t}')
+              curl -sS -X POST -H 'Content-type: application/json' --data "$payload" "$SLACK_WEBHOOK_URL" >/dev/null
+              echo "posted: $FILE"
+            else
+              payload=$(jq -n --arg t "주간 리포트 생성 실패(본문 없음) - $SRC" '{text:$t}')
+              curl -sS -X POST -H 'Content-type: application/json' --data "$payload" "$SLACK_WEBHOOK_URL" >/dev/null
+              echo "empty: $FILE"
+            fi
+          done
+
+      - name: Save JSON artifacts (optional)
+        uses: actions/upload-artifact@v4
+        with:
+          name: weekly-json
+          path: |
+            weekly_summary_*.json
