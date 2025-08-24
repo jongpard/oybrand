@@ -1,236 +1,272 @@
+# report_agg.py
 # -*- coding: utf-8 -*-
-"""Weekly marketplace ranking report
-
-Reads last 7 days CSVs from Google Drive (rank/{oykorea,oyglobal,amazon,qoo10,daiso}),
-aggregates weekly stats (OUT-penalty), and posts Slack blocks.
-Product names are printed in FULL (raw).
-
-Env:
-  GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN
-  GDRIVE_FOLDER_ID, SLACK_WEBHOOK_URL
-"""
-import io, os, re, json, math, logging
-from urllib.parse import urlparse, parse_qs
-from datetime import datetime
+import os, re, glob, json
 import pandas as pd
-import requests
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload
-from google.auth.transport.requests import Request
-from google.oauth2.credentials import Credentials
+from datetime import datetime, timedelta, timezone
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-L = logging.getLogger("weekly")
+KST = timezone(timedelta(hours=9))
 
-SUBFOLDERS = ["oykorea","oyglobal","amazon","qoo10","daiso"]
-TOP_CAP = {"oykorea":100,"oyglobal":100,"amazon":100,"qoo10":200,"daiso":200}
-PENALTY = {k:v+1 for k,v in TOP_CAP.items()}
+# ===== 1) 소스/키/표준 컬럼 =====
+SOURCE_KEY_MAP = {
+    "oy_kor": "goodsNo",
+    "oy_global": "productId",
+    "amazon_us": "asin",
+    "qoo10_jp": "product_code",
+    "daiso_kr": "pdNo",
+}
 
-RE_PROMO = re.compile(r"(올영픽|특가|1\+1|더블|기획|에디션)")
-RE_PICK  = re.compile(r"(?i)(?<!올영)\bpick\b")
+VALID_SOURCES = set(SOURCE_KEY_MAP.keys())
 
-def key_from_url(market, url):
-    if not isinstance(url, str): return None
-    p = urlparse(url); qs = parse_qs(p.query or "")
-    if market=="oykorea":  return qs.get("goodsNo",[None])[0]
-    if market=="oyglobal": return qs.get("productId",[None])[0]
-    if market=="amazon":
-        m = re.search(r"/dp/([A-Z0-9]{10})", p.path or "", re.I)
-        return (m.group(1) if m else qs.get("asin",[None])[0])
-    if market=="qoo10":    return qs.get("product_code",[None])[0]
-    if market=="daiso":    return qs.get("pdNo",[None])[0]
-    return None
+def norm_source(s: str) -> str:
+    s = (s or "").strip().lower()
+    # 흔한 변형들 통일
+    s = s.replace("oliveyoung_korea", "oy_kor").replace("oliveyoung_global", "oy_global")
+    s = s.replace("oy_korea", "oy_kor").replace("amazon", "amazon_us")
+    s = s.replace("qoo10", "qoo10_jp").replace("daiso", "daiso_kr")
+    return s
 
-def drive_service():
-    creds = Credentials(
-        token=None,
-        refresh_token=os.environ["GOOGLE_REFRESH_TOKEN"],
-        token_uri="https://oauth2.googleapis.com/token",
-        client_id=os.environ["GOOGLE_CLIENT_ID"],
-        client_secret=os.environ["GOOGLE_CLIENT_SECRET"],
-        scopes=["https://www.googleapis.com/auth/drive.readonly"],
-    )
-    creds.refresh(Request())
-    return build("drive","v3",credentials=creds, cache_discovery=False)
+def clean_key(x: str) -> str:
+    x = str(x).strip()
+    # 키에서 쓸데없는 문자 제거
+    x = re.sub(r"[^A-Za-z0-9_\-]", "", x)
+    return x.upper()  # 아마존 asin 대문자 통일
 
-def list_children_folders(svc, parent_id):
-    q = f"'{parent_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
-    out, tok = [], None
-    while True:
-        resp = svc.files().list(q=q, fields="nextPageToken, files(id,name)", pageToken=tok).execute()
-        out += resp.get("files",[]); tok = resp.get("nextPageToken")
-        if not tok: break
-    return out
-
-def list_files_in_folder(svc, folder_id):
-    q = f"'{folder_id}' in parents and mimeType!='application/vnd.google-apps.folder' and trashed=false"
-    out, tok = [], None
-    while True:
-        resp = svc.files().list(q=q, fields="nextPageToken, files(id,name,modifiedTime)", pageToken=tok).execute()
-        out += resp.get("files",[]); tok = resp.get("nextPageToken")
-        if not tok: break
-    return out
-
-DATE_RE = re.compile(r"(20\d{2}-\d{2}-\d{2})")
-def parse_date(name): m=DATE_RE.search(name or ""); return m.group(1) if m else None
-
-def download_csv(svc, fid, name):
-    req = svc.files().get_media(fileId=fid)
-    buf = io.BytesIO(); downloader = MediaIoBaseDownload(buf, req)
-    done=False
-    while not done: status, done = downloader.next_chunk()
-    for enc in ("utf-8-sig","utf-8","cp949"):
+# ===== 2) 파일 로딩/표준화 =====
+def load_daily_csvs(folder: str, start_date: str, end_date: str) -> pd.DataFrame:
+    """
+    folder 하위의 모든 CSV 중 날짜 컬럼이 [start_date, end_date]에 포함되는 데이터만 로드.
+    CSV 컬럼 가정: date, source, rank, product, brand, url, price, currency, (각 소스별 키 컬럼 존재 혹은 url에서 추출)
+    """
+    paths = glob.glob(os.path.join(folder, "*.csv"))
+    rows = []
+    d0 = pd.to_datetime(start_date)
+    d1 = pd.to_datetime(end_date)
+    for p in paths:
         try:
-            buf.seek(0); return pd.read_csv(buf, encoding=enc)
-        except Exception: pass
-    raise RuntimeError(f"CSV read fail: {name}")
+            df = pd.read_csv(p)
+        except Exception:
+            continue
+        if "date" not in df.columns:
+            continue
+        df["date"] = pd.to_datetime(df["date"])
+        df = df[(df["date"] >= d0) & (df["date"] <= d1)].copy()
+        if not len(df):
+            continue
 
-def normalize_columns(df):
-    colmap = {}
-    for c in df.columns:
-        lc = str(c).strip().lower()
-        if lc in ("rank","순위"): colmap[c]="rank"
-        elif lc in ("name","상품명","제품명","title"): colmap[c]="name"
-        elif lc in ("brand","브랜드"): colmap[c]="brand"
-        elif lc in ("url","링크"): colmap[c]="url"
-        elif lc in ("discount","할인율","discount_rate"): colmap[c]="discount_rate"
-        elif lc in ("price","가격"): colmap[c]="price"
-        elif lc in ("category","카테고리"): colmap[c]="category"
-    df = df.rename(columns=colmap)
-    for col in ["rank","name","url"]:
-        if col not in df.columns: df[col]=None
-    keep = [c for c in ["rank","name","brand","price","discount_rate","category","url"] if c in df.columns]
-    return df[keep]
+        # 소스 통일
+        if "source" not in df.columns:
+            continue
+        df["source"] = df["source"].map(norm_source)
 
-def load_market_last7(svc, parent_id, market):
-    sub = {f["name"]: f["id"] for f in list_children_folders(svc, parent_id)}
-    if market not in sub:
-        L.warning("subfolder missing: %s", market); return pd.DataFrame()
-    files = list_files_in_folder(svc, sub[market])
-    pairs = [(parse_date(f["name"]), f) for f in files if parse_date(f["name"])]
-    pairs.sort(key=lambda x:x[0], reverse=True)
-    dates = sorted({d for d,_ in pairs})[-7:]
-    dates = sorted(dates)
-    selected = [f for d,f in pairs if d in dates]
-    frames=[]
-    for f in selected:
-        d=parse_date(f["name"])
-        try:
-            df=download_csv(svc, f["id"], f["name"])
-            df=normalize_columns(df)
-            df["rank"]=pd.to_numeric(df["rank"], errors="coerce")
-            df["date"]=d; df["market"]=market
-            df["key"]=df["url"].apply(lambda u: key_from_url(market,u))
-            frames.append(df)
-        except Exception as e:
-            L.exception("read fail %s: %s", f["name"], e)
-    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+        # 표준 컬럼 보정
+        for col in ["product", "brand", "url", "currency"]:
+            if col not in df.columns:
+                df[col] = None
+        if "rank" in df.columns:
+            df["rank"] = pd.to_numeric(df["rank"], errors="coerce")
+        else:
+            continue
 
-def weekly_aggregate(df, market):
-    if df.empty: return {}
-    cap, pen = TOP_CAP[market], PENALTY[market]
-    df = df[df["rank"].le(cap)]
-    latest_name = (df.sort_values("date").groupby("key")["name"]
-                     .agg(lambda s: s.dropna().iloc[-1] if s.dropna().size else None))
-    latest_brand = (df.sort_values("date").groupby("key")["brand"]
-                     .agg(lambda s: s.dropna().iloc[-1] if s.dropna().size else None))
-    dates = sorted(df["date"].unique())
-    piv = df.pivot_table(index="key", columns="date", values="rank", aggfunc="min").reindex(columns=dates)
-    piv_filled = piv.fillna(pen)
-    summary = pd.DataFrame({
-        "key": piv_filled.index,
-        "name": latest_name.reindex(piv_filled.index).values,
-        "brand": latest_brand.reindex(piv_filled.index).values,
-        "avg_rank": piv_filled.mean(axis=1).values,
-        "best_rank": piv.min(axis=1).values,
-        "days_in": piv.notna().sum(axis=1).values,
-    }).sort_values(["avg_rank","best_rank"]).reset_index(drop=True)
-    top10 = summary.head(10).copy()
-
-    # movement (last vs prev)
-    mv = []
-    if len(dates)>=2:
-        t = df[df["date"]==dates[-1]].set_index("key")["rank"]
-        p = df[df["date"]==dates[-2]].set_index("key")["rank"]
-        for _,r in top10.iterrows():
-            k=r["key"]; tr=t.get(k, math.nan); pr=p.get(k, math.nan)
-            if pd.isna(pr) and not pd.isna(tr): mv.append("NEW")
-            elif not pd.isna(pr) and pd.isna(tr): mv.append("OUT")
-            elif pd.isna(pr) and pd.isna(tr): mv.append("")
-            else:
-                d=int(pr-tr)
-                mv.append(f"▲{d}" if d>0 else ("▼{}".format(-d) if d<0 else "—"))
-    else:
-        mv = [""]*len(top10)
-    top10["move"]=mv
-
-    # tags (olive young only)
-    if market in ("oykorea","oyglobal"):
-        def tag(s):
-            s = s or ""
-            promo = bool(RE_PROMO.search(s)); pick=bool(RE_PICK.search(s))
-            if promo and pick: return "프로모션 + Pick"
-            if promo: return "프로모션"
-            if pick: return "Pick"
-            return ""
-        top10["tag"]=top10["name"].apply(tag)
-    else:
-        top10["tag"]=""
-
-    # brand share
-    bs = (pd.concat([
-            df.groupby("brand")["key"].nunique().rename("sku"),
-            df.groupby("brand").size().rename("hits")
-        ], axis=1).fillna(0).sort_values(["sku","hits"], ascending=False).head(10).reset_index())
-    return {"dates":dates, "top10":top10, "brand_share":bs}
-
-def to_slack_blocks(market, agg):
-    title_map = {
-        "oykorea":"올리브영 국내 Top100",
-        "oyglobal":"올리브영 글로벌 Top100",
-        "amazon":"아마존 US Top100",
-        "qoo10":"큐텐 재팬 뷰티 Top200",
-        "daiso":"다이소몰 뷰티/위생 Top200",
-    }
-    title = title_map.get(market, market)
-    d0,d1 = (agg["dates"][0], agg["dates"][-1]) if agg.get("dates") else ("","")
-    lines=[]
-    for i,r in agg["top10"].reset_index(drop=True).iterrows():
-        tag = f" · {r['tag']}" if r.get("tag") else ""
-        move = f" {r['move']}" if r.get("move") else ""
-        lines.append(f"{i+1}. {str(r['name'])}{tag} (등장 {int(r['days_in'])}일){move}")
-    top10_txt = "\n".join(lines) if lines else "데이터 없음"
-
-    bs_lines = [f"{str(r['brand'])} {int(r['sku'])}개 ({int(r['hits'])}회)" for _,r in agg["brand_share"].iterrows()]                if len(agg.get("brand_share",[])) else []
-    brand_txt = " · ".join(bs_lines) if bs_lines else "데이터 없음"
-
-    return [
-        {"type":"header","text":{"type":"plain_text","text":f"📊 주간 리포트 · {title} ({d0}~{d1})"}},
-        {"type":"section","text":{"type":"mrkdwn","text":f"*🏆 Top10 (패널티 평균, raw 제품명)*\n{top10_txt}"}},
-        {"type":"section","text":{"type":"mrkdwn","text":f"*🏷️ 브랜드 점유율*\n{brand_txt}"}},
-        {"type":"context","elements":[{"type":"mrkdwn","text":"※ 기준: url 키로 동일상품 식별, 미등장일 패널티 적용(Top100→101 / Top200→201)"}]}
-    ]
-
-def post_slack(blocks):
-    url = os.environ.get("SLACK_WEBHOOK_URL")
-    if not url: print(json.dumps({"blocks":blocks}, ensure_ascii=False, indent=2)); return
-    r = requests.post(url, json={"blocks":blocks}, timeout=30)
-    if r.status_code>=300: L.error("Slack error %s %s", r.status_code, r.text)
-
-def main():
-    parent = os.environ["GDRIVE_FOLDER_ID"]
-    svc = drive_service()
-    for market in SUBFOLDERS:
-        try:
-            df = load_market_last7(svc, parent, market)
-            if df.empty: 
-                L.warning("no data: %s", market); 
+        # 키 보정: 우선 각 소스의 키 컬럼이 있으면 사용, 없으면 URL에서 추출
+        for src, keycol in SOURCE_KEY_MAP.items():
+            mask = df["source"].eq(src)
+            if not mask.any():
                 continue
-            agg = weekly_aggregate(df, market)
-            blocks = to_slack_blocks(market, agg)
-            post_slack(blocks)
-        except Exception as e:
-            L.exception("market %s failed: %s", market, e)
+            if keycol not in df.columns or df.loc[mask, keycol].isna().all():
+                # URL에서 추출
+                df.loc[mask, keycol] = df.loc[mask, "url"].map(lambda u: extract_key_from_url(src, u))
+            df.loc[mask, "key"] = df.loc[mask, keycol].map(clean_key)
 
+        rows.append(df)
+    if not rows:
+        return pd.DataFrame(columns=[
+            "date","source","rank","product","brand","url","price","currency","key"
+        ])
+    out = pd.concat(rows, ignore_index=True)
+    out = out[out["source"].isin(VALID_SOURCES)]
+    out = out.dropna(subset=["rank","key"])
+    return out
+
+def extract_key_from_url(src: str, url: str) -> str:
+    url = str(url or "")
+    if src == "oy_kor":
+        m = re.search(r"goodsNo=([0-9A-Za-z\-]+)", url)
+        return m.group(1) if m else ""
+    if src == "oy_global":
+        m = re.search(r"productId=([0-9A-Za-z\-]+)", url)
+        return m.group(1) if m else ""
+    if src == "amazon_us":
+        m = re.search(r"/([A-Z0-9]{10})(?:[/?]|$)", url.upper())
+        return m.group(1) if m else ""
+    if src == "qoo10_jp":
+        m = re.search(r"product_code=([0-9A-Za-z\-]+)", url)
+        return m.group(1) if m else ""
+    if src == "daiso_kr":
+        m = re.search(r"pdNo=([0-9A-Za-z\-]+)", url)
+        return m.group(1) if m else ""
+    return ""
+
+# ===== 3) 주간/월간 윈도우 =====
+def week_window(end_date_kst: datetime) -> tuple[str,str]:
+    # KST 기준 월(0)~일(6) 주차. end_date가 일요일이면 그 주의 월~일 반환
+    end_date_kst = end_date_kst.astimezone(KST)
+    end_w = end_date_kst - timedelta(days=end_date_kst.weekday() - 6)  # 일요일로 보정
+    start_w = end_w - timedelta(days=6)
+    return start_w.strftime("%Y-%m-%d"), end_w.strftime("%Y-%m-%d")
+
+def month_window(end_date_kst: datetime) -> tuple[str,str]:
+    end_date_kst = end_date_kst.astimezone(KST)
+    end = end_date_kst.replace(day=1) + timedelta(days=32)
+    end = end.replace(day=1) - timedelta(days=1)  # 해당월 말일
+    start = end.replace(day=1)
+    return start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
+
+# ===== 4) 집계 =====
+def aggregate(df: pd.DataFrame, min_days:int=3, topn:int=100) -> dict:
+    """
+    반환: {source: {'top10': DataFrame, 'brand_share': DataFrame}}
+    """
+    result = {}
+    if df.empty:
+        for s in VALID_SOURCES:
+            result[s] = {"top10": pd.DataFrame(), "brand_share": pd.DataFrame()}
+        return result
+
+    # 각 소스별 처리
+    for src in sorted(df["source"].unique()):
+        keycol = "key"
+        d = df[df["source"].eq(src)].copy()
+        if d.empty:
+            result[src] = {"top10": pd.DataFrame(), "brand_share": pd.DataFrame()}
+            continue
+
+        # 상위 노출만 사용 (topn)
+        d = d[pd.to_numeric(d["rank"], errors="coerce")<=topn].copy()
+
+        # 최근 이름/URL 폴백 우선순위
+        latest = (d.sort_values(["date"])
+                    .groupby(keycol, as_index=False)
+                    .agg({
+                        "product": "last",
+                        "brand": "last",
+                        "url": "last",
+                        "currency": "last"
+                    }))
+        # 제품명 폴백
+        latest["product"] = latest["product"].fillna("")
+        latest["brand"] = latest["brand"].fillna("")
+        latest["product"] = latest.apply(
+            lambda r: r["product"] if r["product"] else (r["brand"] if r["brand"] else r[keycol]),
+            axis=1
+        )
+
+        # 주간 평균/등장일
+        agg = (d.groupby(keycol, as_index=False)
+                 .agg(mean_rank=("rank","mean"),
+                      days=("rank","count"),
+                      best=("rank","min")))
+
+        # 최소 등장일 필터
+        agg = agg[agg["days"]>=min_days].copy()
+
+        # 조인(키 타입 통일)
+        latest[keycol] = latest[keycol].map(clean_key)
+        agg[keycol] = agg[keycol].map(clean_key)
+        top = (agg.merge(latest, on=keycol, how="left")
+                  .sort_values(["mean_rank","best"])
+                  .head(10)
+               )
+
+        # 브랜드 점유율 (주간 노출수 기준, 동일키 중복일 모두 카운트)
+        brand = d.copy()
+        brand["brand"] = brand["brand"].fillna("기타")
+        brand_cnt = (brand.groupby("brand", as_index=False)
+                          .agg(count=("rank","count")))
+        brand_cnt = brand_cnt.sort_values("count", ascending=False)
+
+        result[src] = {"top10": top, "brand_share": brand_cnt}
+    return result
+
+# ===== 5) 슬랙용 포맷 =====
+def arrow(delta:int) -> str:
+    if delta > 0: return f"▼{abs(delta)}"
+    if delta < 0: return f"▲{abs(delta)}"
+    return "—"
+
+def format_top10(df_top: pd.DataFrame, prev_top: pd.DataFrame|None=None) -> list[str]:
+    if df_top is None or df_top.empty:
+        return ["데이터 없음"]
+    # 이전주 평균순위 대비 변화 계산(선택)
+    prev_map = {}
+    if isinstance(prev_top, pd.DataFrame) and not prev_top.empty:
+        prev_map = dict(zip(prev_top["key"], prev_top["mean_rank"]))
+
+    lines = []
+    for i, r in enumerate(df_top.itertuples(), 1):
+        prev_mean = prev_map.get(getattr(r,"key"), None)
+        delta_text = ""
+        if prev_mean is not None:
+            diff = int(round(getattr(r,"mean_rank") - prev_mean))
+            delta_text = f" {arrow(diff)}"
+
+        nm = getattr(r,"product") or getattr(r,"key")
+        url = getattr(r,"url") or ""
+        name_txt = f"<{url}|{nm}>" if url else nm
+        lines.append(f"{i}. {name_txt} (등장 {int(r.days)}일){delta_text}")
+    return lines
+
+def format_brand_share(df_brand: pd.DataFrame, topk:int=12) -> list[str]:
+    if df_brand is None or df_brand.empty:
+        return ["데이터 없음"]
+    df = df_brand.head(topk)
+    return [f"{r.brand} {int(r.count)}개" for r in df.itertuples()]
+
+# ===== 6) 엔드포인트 =====
+def build_summary(data_folder:str, mode:str="week", end_date:str|None=None,
+                  min_days:int=3, topn:int=100, prev_folder:str|None=None) -> dict:
+    """
+    반환: {source: {'top10_lines': [...], 'brand_lines': [...], 'range': 'YYYY-MM-DD~YYYY-MM-DD'}}
+    """
+    if end_date:
+        end_dt = datetime.fromisoformat(end_date).astimezone(KST)
+    else:
+        end_dt = datetime.now(tz=KST)
+
+    if mode == "week":
+        start, end = week_window(end_dt)
+    elif mode == "month":
+        start, end = month_window(end_dt)
+    else:
+        raise ValueError("mode must be 'week' or 'month'")
+
+    df = load_daily_csvs(data_folder, start, end)
+    agg_now = aggregate(df, min_days=min_days, topn=topn)
+
+    # 이전 기간(증감용) 선택
+    prev_map = {}
+    if prev_folder:
+        if mode == "week":
+            prev_end = datetime.fromisoformat(end) - timedelta(days=7)
+            pstart, pend = week_window(prev_end)
+        else:
+            prev_end = (datetime.fromisoformat(end).replace(day=1) - timedelta(days=1))
+            pstart, pend = month_window(prev_end)
+        df_prev = load_daily_csvs(prev_folder, pstart, pend)
+        prev_map = aggregate(df_prev, min_days=min_days, topn=topn)
+
+    out = {}
+    for src in VALID_SOURCES:
+        top = agg_now[src]["top10"]
+        prev_top = prev_map.get(src, {}).get("top10") if prev_map else None
+        top_lines = format_top10(top, prev_top)
+        brand_lines = format_brand_share(agg_now[src]["brand_share"])
+        out[src] = {"top10_lines": top_lines, "brand_lines": brand_lines, "range": f"{start}~{end}"}
+    return out
+
+# ===== 7) 로컬 테스트 =====
 if __name__ == "__main__":
-    main()
+    # 예시
+    folder = "./data/daily"          # 일간 CSV 위치
+    prev_folder = "./data/daily"     # 동일 폴더에서 이전주/이전월 비교
+    res = build_summary(folder, mode="week", prev_folder=prev_folder)
+    print(json.dumps(res, ensure_ascii=False, indent=2))
