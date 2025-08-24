@@ -16,7 +16,7 @@ SRC_INFO = {
 }
 ALL_SRCS = list(SRC_INFO.keys())
 
-# 컬럼 동의어 (제품명은 raw_name을 최우선으로 사용)
+# === 컬럼 동의어 (제품명은 raw_name 최우선, 그대로 표기) ===
 COLS = {
     'rank':        ['rank','순위','ranking','랭킹'],
     'raw_name':    ['raw_name','raw','rawProduct','rawTitle'],
@@ -28,7 +28,6 @@ COLS = {
     'price':       ['price','가격','sale_price','selling_price'],
     'orig_price':  ['orig_price','정가','original_price','소비자가','list_price'],
     'discount':    ['discount_rate','할인율','discount','discountPercent'],
-    # ID 후보
     'goodsNo':     ['goodsNo','goods_no','goodsno','상품번호','상품코드'],
     'productId':   ['productId','product_id','prdtNo','상품ID','상품아이디','상품코드'],
     'asin':        ['asin','ASIN'],
@@ -63,13 +62,10 @@ def pick(df, names):
     return None
 
 def pick_loose_product(df):
-    # raw_name 최우선
     rn = pick(df, COLS['raw_name'])
     if rn: return rn
-    # 동의어
     pn = pick(df, COLS['product'])
     if pn: return pn
-    # 느슨한 매칭
     patt = re.compile(r"(product|name|title|상품|제품|품명|아이템)", re.IGNORECASE)
     for c in df.columns:
         if patt.search(str(c)): return c
@@ -114,7 +110,7 @@ def extract_key(src:str, row, url:str|None):
             if c in row and pd.notna(row[c]): return str(row[c]).strip()
         m = re.search(r'product_code=([0-9A-Za-z\-]+)', u)
         if m: return m.group(1)
-        m2 = re.search(r'/(\d{6,})', u)  # URL 말단 숫자
+        m2 = re.search(r'/(\d{6,})', u)
         return m2.group(1) if m2 else None
     if src == 'daiso_kr':
         for c in COLS['pdNo']:
@@ -127,27 +123,18 @@ def load_unified(data_dir:str)->pd.DataFrame:
     rows = []
     for p in paths:
         src = infer_source(p)
-        if not src:
-            continue
+        if not src: continue
         try:
             df = read_csv_any(p)
         except Exception:
             continue
 
-        # 날짜
         date_col = pick(df, COLS['date'])
-        if date_col:
-            dates = pd.to_datetime(df[date_col], errors='coerce')
-        else:
-            dates = pd.Series([infer_date_from_filename(p)]*len(df))
-
-        # 순위
+        dates = pd.to_datetime(df[date_col], errors='coerce') if date_col else pd.Series([infer_date_from_filename(p)]*len(df))
         rank_col = pick(df, COLS['rank'])
-        if not rank_col:
-            continue
+        if not rank_col: continue
 
-        # 이름/브랜드/URL/가격/할인
-        prod_col = pick_loose_product(df)     # raw_name 우선!
+        prod_col = pick_loose_product(df)     # raw_name 우선, 그대로 사용
         brand_col = pick(df, COLS['brand'])
         url_col   = pick(df, COLS['url'])
         price_col = pick(df, COLS['price'])
@@ -155,8 +142,8 @@ def load_unified(data_dir:str)->pd.DataFrame:
         disc_col  = pick(df, COLS['discount'])
 
         for i, r in df.iterrows():
-            nm = str(r.get(prod_col)) if prod_col else None  # raw 그대로 사용
-            rec = {
+            nm = str(r.get(prod_col)) if prod_col else None
+            rows.append({
                 'source': src,
                 'date': dates.iloc[i],
                 'rank': pd.to_numeric(r.get(rank_col), errors='coerce'),
@@ -166,9 +153,8 @@ def load_unified(data_dir:str)->pd.DataFrame:
                 'price': pd.to_numeric(r.get(price_col), errors='coerce') if price_col else None,
                 'orig_price': pd.to_numeric(r.get(orig_col), errors='coerce') if orig_col else None,
                 'discount_rate': pd.to_numeric(r.get(disc_col), errors='coerce') if disc_col else None,
-            }
-            rec['key'] = extract_key(src, r, rec['url'])
-            rows.append(rec)
+                'key': extract_key(src, r, r.get(url_col) if url_col else None),
+            })
 
     ud = pd.DataFrame(rows, columns=['source','date','rank','product','brand','url','price','orig_price','discount_rate','key'])
     ud = ud.dropna(subset=['source','date','rank','key'])
@@ -185,7 +171,7 @@ def week_range_for_source(ud:pd.DataFrame, src:str):
 def _arrow_points(diff: float) -> str:
     if diff is None or (isinstance(diff,float) and math.isnan(diff)): return "—"
     d = int(round(diff))
-    if d > 0: return f"▲{d}"
+    if d > 0: return f"▲{d}"    # 점수 상승 = 개선
     if d < 0: return f"▼{abs(d)}"
     return "—"
 
@@ -195,8 +181,7 @@ def _day_set(df, day, topn):
 
 def _inout_daily(cur, prev, topn, start):
     days = sorted(set(cur['date'].dt.date))
-    if not days:
-        return 0, 0, 0.0
+    if not days: return 0, 0, 0.0
     prev_last = _day_set(prev, (start - pd.Timedelta(days=1)).date(), topn) if not prev.empty else set()
     total_in = total_out = 0
     last_set = prev_last
@@ -207,7 +192,6 @@ def _inout_daily(cur, prev, topn, start):
         total_in  += len(enter)
         total_out += len(leave)
         last_set = cur_set
-    # 데이터 결함 방지: 강제 동치
     if total_in != total_out:
         m = max(total_in, total_out)
         total_in = total_out = m
@@ -216,11 +200,10 @@ def _inout_daily(cur, prev, topn, start):
 def _weekly_points_table(df, topn):
     tmp = df.copy()
     tmp['__pts'] = topn + 1 - tmp['rank']
-    agg = (tmp.groupby('key', as_index=False)
-             .agg(points=('__pts','sum'),
-                  days=('rank','count'),
-                  best=('rank','min')))
-    return agg
+    return (tmp.groupby('key', as_index=False)
+                .agg(points=('__pts','sum'),
+                     days=('rank','count'),
+                     best=('rank','min')))
 
 def summarize_week(ud:pd.DataFrame, src:str, min_days:int=3):
     res = {
@@ -255,7 +238,6 @@ def summarize_week(ud:pd.DataFrame, src:str, min_days:int=3):
               (ud['date']<=start - pd.Timedelta(days=1)) &
               (ud['rank']<=topn)].copy()
 
-    # 주간 점수
     pts = _weekly_points_table(cur, topn)
     pts = pts[pts['days'] >= min_days]
     latest = (cur.sort_values('date')
@@ -272,6 +254,7 @@ def summarize_week(ud:pd.DataFrame, src:str, min_days:int=3):
              .sort_values(['points','days','best'], ascending=[False, False, True])
              .head(10))
 
+    # === Top10 라인: '주간점수' 문구 제거, '유지' 용어 사용, 화살표는 점수 증감 ===
     top_lines = []
     for i, r in enumerate(top.itertuples(), 1):
         prev_p = prev_pts_map.get(getattr(r,'key'))
@@ -279,9 +262,9 @@ def summarize_week(ud:pd.DataFrame, src:str, min_days:int=3):
         nm = getattr(r,'product') or getattr(r,'brand') or getattr(r,'key')
         u  = getattr(r,'url') or ''
         label = f"<{u}|{nm}>" if u else nm
-        top_lines.append(f"{i}. {label} (점수 {int(getattr(r,'points'))}, 등장 {int(getattr(r,'days'))}일) {_arrow_points(diff)}")
+        top_lines.append(f"{i}. {label} (유지 {int(getattr(r,'days'))}일) {_arrow_points(diff)}")
 
-    # 브랜드 점유율 (지난주 동일 윈도우 비교)
+    # === 브랜드 점유율: 전주 동일 윈도우 비교 ===
     b_now = (cur.assign(brand=cur['brand'].fillna('기타'))
                .groupby('brand').size().reset_index(name='count'))
     if not prev.empty:
@@ -294,15 +277,15 @@ def summarize_week(ud:pd.DataFrame, src:str, min_days:int=3):
     b = b.sort_values(['count','delta'], ascending=[False, False]).head(12)
     brand_lines = []
     for r in b.itertuples():
+        sign = "—"
         if r.delta > 0: sign = f"▲{int(r.delta)}"
         elif r.delta < 0: sign = f"▼{abs(int(r.delta))}"
-        else: sign = "—"
         brand_lines.append(f"{r.brand} {int(r.count)}개 {sign}")
 
-    # IN/OUT (항상 동치)
+    # === IN/OUT: 전일 대비 집합 기준 → 항상 동치 ===
     in_cnt, out_cnt, daily_avg = _inout_daily(cur, prev, topn, start)
 
-    # 신규 히어로 / 반짝
+    # 신규 히어로 / 반짝 (raw_name 그대로 표기)
     hist_keys = set(hist['key'].unique()) if not hist.empty else set()
     heroes = (pts[~pts['key'].isin(hist_keys)]
                 .merge(latest, on='key', how='left')
@@ -377,7 +360,7 @@ def format_slack_block(src:str, s:dict)->str:
     }
     lines = []
     lines.append(f"📊 주간 리포트 · {title_map.get(src, src)} ({s['range']})")
-    lines.append("🏆 Top10 (주간 점수, raw 제품명)")
+    lines.append("🏆 Top10 (raw 제품명)")
     lines.extend(s['top10_lines'] or ["데이터 없음"])
     lines.append("")
     lines.append("🍞 브랜드 점유율")
