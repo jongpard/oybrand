@@ -45,19 +45,20 @@ jobs:
         run: |
           python scripts/check_daily_scan.py || true
 
-      - name: Run weekly report
+      - name: Run weekly report (PLUS)
         env:
           DATA_DIR: ./data/daily
-          MIN_DAYS: 1   # 테스트 완료 후 3으로
+          MIN_DAYS: 1    # 첫 실행 확인 후 3으로
         run: |
-          python scripts/weekly_report_v2.py | tee weekly_summary.json
-          test -s weekly_summary.json || echo "{}" > weekly_summary.json
+          python scripts/weekly_report_plus.py | tee weekly_summary.json
+          test -s weekly_slack_message.txt || echo "주간 리포트 생성 실패(본문 없음)" > weekly_slack_message.txt
 
-      - name: Post to Slack (optional)
+      - name: Post to Slack (formatted)
         if: env.SLACK_WEBHOOK_URL != ''
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: |
-          payload=$(jq -n --arg t "$(cat weekly_summary.json)" '{text:$t}')
+          text="$(cat weekly_slack_message.txt)"
+          payload=$(jq -n --arg t "$text" '{text:$t}')
           curl -s -X POST -H 'Content-type: application/json' \
             --data "$payload" "$SLACK_WEBHOOK_URL" || true
