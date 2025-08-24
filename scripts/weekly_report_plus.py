@@ -1,6 +1,6 @@
 # scripts/weekly_report_plus.py
 # -*- coding: utf-8 -*-
-import os, re, glob, json, math
+import os, re, glob, json, math, argparse
 import pandas as pd
 from collections import Counter
 from datetime import timedelta, timezone
@@ -20,8 +20,7 @@ ALL_SRCS = list(SRC_INFO.keys())
 COLS = {
     'rank':        ['rank','순위','ranking','랭킹'],
     'raw_name':    ['raw_name','raw','rawProduct','rawTitle'],
-    'product':     ['product','제품명','상품명','name','title','goods_name','goodsNm',
-                    'prdNm','prdtName','displayName','itemNm','상품','item_name','item'],
+    'product':     ['product','제품명','상품명','name','title','goods_name','goodsNm','prdNm','prdtName','displayName','itemNm','상품','item_name','item'],
     'brand':       ['brand','브랜드','brand_name','brandNm','브랜드명'],
     'url':         ['url','링크','product_url','link','detail_url'],
     'date':        ['date','날짜','수집일','crawl_date','created_at'],
@@ -35,7 +34,7 @@ COLS = {
     'pdNo':        ['pdNo','pdno','상품번호','상품코드'],
 }
 
-# === 키워드 사전(제품/효능/마케팅) ===
+# === 키워드 사전(제품형태/효능/마케팅/인플루언서) ===
 KW_PRODUCT = {
     '패드': r'(패드|pad)',
     '마스크팩': r'(마스크팩|마스크|sheet\s*mask|mask\s*pack)',
@@ -62,6 +61,13 @@ KW_MARKETING = {
     '한정/NEW': r'(한정|리미티드|limited|NEW|new\b|신상)',
     '쿠폰/딜': r'(쿠폰|coupon|딜|deal|특가|sale|세일|event|프로모션|promotion)',
     'PICK/콜라보': r'(올영픽|PICK|pick|콜라보|collab)',
+}
+KW_INFLUENCER = {
+    '이사배': r'(이사배)',
+    '장원영': r'(장원영)',
+    '스텔라유니': r'(스텔라유니|StellaYooni)',
+    '하초롱초': r'(하초롱초|Hacho)',
+    # 필요시 추가
 }
 
 STOPWORDS = set("""
@@ -153,8 +159,7 @@ def fmt_money(v, src):
     cur = SRC_INFO[src]['currency']
     if cur == 'USD':  return f"${v:,.0f}"
     if cur == 'JPY':  return f"¥{v:,.0f}"
-    # default KRW
-    return f"₩{v:,.0f}"
+    return f"₩{v:,.0f}"  # default KRW
 
 # ---------- 프로모션 플래그 ----------
 PROMO_RE = re.compile(
@@ -259,7 +264,7 @@ def summarize_week(ud:pd.DataFrame, src:str, min_days:int=3):
         'discount_delta_same': None,
         'median_price': None,
         'cat_top5': [],
-        'kw_lines': [],     # 키워드 3군 표현
+        'kw_lines': [],     # 주간 키워드 분석(제품형태/효능/마케팅/인플루언서)
         'insights': [],
         'stats': {},
     }
@@ -319,7 +324,7 @@ def summarize_week(ud:pd.DataFrame, src:str, min_days:int=3):
              .sort_values(['points','days','best'], ascending=[False, False, True])
              .head(10))
 
-    # Top10 라인: (유지 n일, NEW/↑n/↓n/—)
+    # Top10 라인: (유지 n일) (NEW/↑n/↓n/—)  ← 괄호 분리 표기
     top_lines = []
     for i, r in enumerate(top.itertuples(), 1):
         key = getattr(r,'key')
@@ -331,7 +336,7 @@ def summarize_week(ud:pd.DataFrame, src:str, min_days:int=3):
         prev_mean = prev_mean_map.get(key)
         prev_days = prev_days_map.get(key, 0)
         delta_txt = "NEW" if (prev_mean is None or prev_days < min_days) else _arrow_rank(prev_mean - cur_mean)
-        top_lines.append(f"{i}. {label} (유지 {int(getattr(r,'days'))}일, {delta_txt})")
+        top_lines.append(f"{i}. {label} (유지 {int(getattr(r,'days'))}일) ({delta_txt})")
 
     # 브랜드 "개수/일" 비교 (수집일 차이 보정)
     def brand_daily_avg(base):
@@ -344,26 +349,25 @@ def summarize_week(ud:pd.DataFrame, src:str, min_days:int=3):
               .sort_values(['now','delta'], ascending=[False, False]).head(12))
     brand_lines = []
     for r in b.itertuples():
-        sign = "—"
-        if r.delta > 0: sign = f"↑{round(r.delta,1)}"
+        if r.delta > 0:  sign = f"↑{round(r.delta,1)}"
         elif r.delta < 0: sign = f"↓{abs(round(r.delta,1))}"
-        brand_lines.append(f"{r.brand} {round(r.now,1)}개/일 {sign}")
+        else:            sign = "—"
+        brand_lines.append(f"{r.brand} {round(r.now,1)}개/일 ({sign})")
 
     # IN/OUT: 비교가능한 날만 계산 → 단일 값 표기
     days = sorted(cur_base['day'].unique())
-    prev_days = set(prev_base['day'].unique())
+    prev_days_set = set(prev_base['day'].unique())
     total_in = total_out = 0
     valid = 0
     for d in days:
         pd_ = pd.to_datetime(d) - pd.Timedelta(days=1)
-        if pd_.date() not in prev_days:
+        if pd_.date() not in prev_days_set:
             continue
         cur_set  = set(cur_base.loc[cur_base['day'].eq(d), 'key'])
         prev_set = set(prev_base.loc[prev_base['day'].eq(pd_.date()), 'key'])
         total_in  += len(cur_set - prev_set)
         total_out += len(prev_set - cur_set)
         valid += 1
-    # 이론상 동일
     swaps = max(total_in, total_out)
     inout_text = "비교 기준 없음" if valid == 0 else f"{swaps} (일평균 {round(swaps/valid,2)} · {valid}/{len(days)}일 비교)"
 
@@ -422,34 +426,29 @@ def summarize_week(ud:pd.DataFrame, src:str, min_days:int=3):
     cat_top5 = cats.groupby('__cat').size().sort_values(ascending=False).head(5)
     cat_pairs = [f"{c} {int(n)}개" for c,n in cat_top5.items()]
 
-    # 키워드 3군(제품/효능/마케팅) 점유
+    # 키워드 4군(제품형태/효능/마케팅/인플루언서) 점유(%)
     def bucket_share(base, rules):
-        cnt = Counter()
-        total_hits = 0
+        cnt = Counter(); total_hits = 0
         for nm in base['product'].dropna().astype(str):
             for label, pat in rules.items():
                 if re.search(pat, nm, re.IGNORECASE):
-                    cnt[label] += 1
-                    total_hits += 1
-        items = []
+                    cnt[label] += 1; total_hits += 1
         if total_hits == 0: return []
-        for k, v in cnt.most_common(5):
-            items.append(f"{k} {round(v*100/total_hits,1)}%")
-        return items
-
+        return [f"{k} {round(v*100/total_hits,1)}%" for k,v in cnt.most_common(5)]
     kw_lines = []
-    prod_items = bucket_share(cur_base, KW_PRODUCT)
-    effi_items = bucket_share(cur_base, KW_EFFICACY)
-    mkt_items  = bucket_share(cur_base, KW_MARKETING)
-    if prod_items: kw_lines.append("• 제품형태: " + ", ".join(prod_items))
-    if effi_items: kw_lines.append("• 효능: " + ", ".join(effi_items))
-    if mkt_items:  kw_lines.append("• 마케팅: " + ", ".join(mkt_items))
+    p_items = bucket_share(cur_base, KW_PRODUCT)
+    e_items = bucket_share(cur_base, KW_EFFICACY)
+    m_items = bucket_share(cur_base, KW_MARKETING)
+    i_items = bucket_share(cur_base, KW_INFLUENCER)
+    if p_items: kw_lines.append("• 제품형태: " + ", ".join(p_items))
+    if e_items: kw_lines.append("• 효능: " + ", ".join(e_items))
+    if m_items: kw_lines.append("• 마케팅: " + ", ".join(m_items))
+    if i_items: kw_lines.append("• 인플루언서: " + ", ".join(i_items))
 
     # 기본 통계 & 인사이트
     uniq_cnt = cur_base['key'].nunique()
     keep_med = int(pts['days'].median()) if not pts.empty else 0
 
-    # 결과
     res.update({
         'range': f"{start.date()}~{end.date()}",
         'top10_lines': top_lines,
@@ -486,10 +485,10 @@ def format_slack_block(src:str, s:dict)->str:
     lines.append("🏆 Top10")
     lines.extend(s['top10_lines'] or ["데이터 없음"])
     lines.append("")
-    lines.append("🍞 브랜드 개수(일평균)")   # 퍼센트 아님
+    lines.append("🍞 브랜드 개수(일평균)")
     lines.extend(s['brand_lines'] or ["데이터 없음"])
     lines.append("")
-    lines.append(f"🔁 인앤아웃: {s['inout']}")   # 단일 값
+    lines.append(f"🔁 인앤아웃(교체): {s['inout']}")   # 단일 값
     if s['heroes']:
         lines.append("🆕 신규 히어로: " + ", ".join(s['heroes']))
     if s['flash']:
@@ -497,20 +496,17 @@ def format_slack_block(src:str, s:dict)->str:
     if s['cat_top5']:
         lines.append("📈 카테고리 상위: " + " · ".join(s['cat_top5']))
     if s['kw_lines']:
-        lines.append("🧾 키워드:"); lines.extend(s['kw_lines'])
+        lines.append("🔎 주간 키워드 분석")
+        lines.extend(s['kw_lines'])
     # 가격/할인 (통화·콤마 + 프로모션 구분)
     tail = []
-    if s.get('median_price') is not None: tail.append("중위가격 " + (fmt_money(s['median_price'], src) or ""))
-    # 할인율 세부
-    disc_all = s.get('discount_all')
-    disc_p   = s.get('discount_promo')
-    disc_n   = s.get('discount_nonpromo')
-    delta_sn = s.get('discount_delta_same')
+    if s.get('median_price') is not None:
+        tail.append("중위가격 " + (fmt_money(s['median_price'], src) or ""))
     disc_bits = []
-    if disc_all is not None: disc_bits.append(f"전체 {disc_all:.2f}%")
-    if disc_p is not None:   disc_bits.append(f"프로모션 {disc_p:.2f}%")
-    if disc_n is not None:   disc_bits.append(f"일반 {disc_n:.2f}%")
-    if delta_sn is not None: disc_bits.append(f"(동일상품 차이 +{delta_sn:.2f}%p)")
+    if s.get('discount_all') is not None: disc_bits.append(f"전체 {s['discount_all']:.2f}%")
+    if s.get('discount_promo') is not None: disc_bits.append(f"프로모션 {s['discount_promo']:.2f}%")
+    if s.get('discount_nonpromo') is not None: disc_bits.append(f"일반 {s['discount_nonpromo']:.2f}%")
+    if s.get('discount_delta_same') is not None: disc_bits.append(f"(동일상품 차이 +{s['discount_delta_same']:.2f}%p)")
     if disc_bits: tail.append("평균 할인율 " + " · ".join(disc_bits))
     if tail: lines.append("💵 " + " / ".join(tail))
     # 최종 인사이트
@@ -521,20 +517,48 @@ def format_slack_block(src:str, s:dict)->str:
             lines.append(f"- {ln}")
     return "\n".join(lines)
 
-# ---------- 엔트리 ----------
+# ---------- 엔트리 (개별 전송 지원) ----------
 def main():
-    data_dir = os.getenv('DATA_DIR','./data/daily')
-    min_days = int(os.getenv('MIN_DAYS','3'))
-    ud = load_unified(data_dir)
-    result = {}
-    slack_texts = []
-    for src in ALL_SRCS:
-        s = summarize_week(ud, src, min_days=min_days)
-        result[src] = s
-        slack_texts.append(format_slack_block(src, s))
-    print(json.dumps(result, ensure_ascii=False, indent=2))
-    with open("weekly_slack_message.txt","w",encoding="utf-8") as f:
-        f.write("\n\n— — —\n\n".join(slack_texts))
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--src", nargs="+", choices=ALL_SRCS + ["all"],
+                        default=os.getenv("ONLY_SRC", "all").split(","))
+    parser.add_argument("--split", action="store_true",
+                        help="소스별 개별 요약/슬랙 파일 생성")
+    parser.add_argument("--data-dir", default=os.getenv("DATA_DIR","./data/daily"))
+    parser.add_argument("--min-days", type=int, default=int(os.getenv("MIN_DAYS","3")))
+    args = parser.parse_args()
+
+    # src 목록 정리
+    targets = []
+    for s in (args.src if isinstance(args.src, list) else [args.src]):
+        targets.extend(ALL_SRCS if s == "all" else [s])
+    targets = [t for t in targets if t in ALL_SRCS]
+
+    ud = load_unified(args.data_dir)
+    combined = {}
+    combined_txt = []
+
+    for src in targets:
+        s = summarize_week(ud, src, min_days=args.min_days)
+        combined[src] = s
+        text = format_slack_block(src, s)
+
+        # 개별 파일 생성
+        with open(f"weekly_summary_{src}.json","w",encoding="utf-8") as f:
+            json.dump(s, f, ensure_ascii=False, indent=2)
+        with open(f"slack_{src}.txt","w",encoding="utf-8") as f:
+            f.write(text)
+
+        if not args.split:
+            combined_txt.append(text)
+
+    # STDOUT에는 전체 JSON
+    print(json.dumps(combined, ensure_ascii=False, indent=2))
+
+    # split이 아니면 합본 텍스트도 저장
+    if not args.split:
+        with open("weekly_slack_message.txt","w",encoding="utf-8") as f:
+            f.write("\n\n— — —\n\n".join(combined_txt))
 
 if __name__ == "__main__":
     main()
