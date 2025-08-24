@@ -30,7 +30,7 @@ jobs:
         GOOGLE_PRIVATE_KEY: ${{ secrets.GOOGLE_PRIVATE_KEY }}
         SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
       run: |
-        python scripts/weekly_analysis.py
+        python weekly_analysis.py
 
     - name: Commit and push if changed
       run: |
