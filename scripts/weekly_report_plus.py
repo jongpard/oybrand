@@ -171,8 +171,8 @@ def week_range_for_source(ud:pd.DataFrame, src:str):
 def _arrow_points(diff: float) -> str:
     if diff is None or (isinstance(diff,float) and math.isnan(diff)): return "—"
     d = int(round(diff))
-    if d > 0: return f"▲{d}"    # 점수 상승 = 개선
-    if d < 0: return f"▼{abs(d)}"
+    if d > 0: return f"↑{d}"    # 점수 상승 = 개선
+    if d < 0: return f"↓{abs(d)}"
     return "—"
 
 def _day_set(df, day, topn):
@@ -254,7 +254,7 @@ def summarize_week(ud:pd.DataFrame, src:str, min_days:int=3):
              .sort_values(['points','days','best'], ascending=[False, False, True])
              .head(10))
 
-    # === Top10 라인: '주간점수' 문구 제거, '유지' 용어 사용, 화살표는 점수 증감 ===
+    # Top10 라인: raw_name 그대로, '유지 n일', 화살표는 점수 증감(↑/↓/—)
     top_lines = []
     for i, r in enumerate(top.itertuples(), 1):
         prev_p = prev_pts_map.get(getattr(r,'key'))
@@ -264,7 +264,7 @@ def summarize_week(ud:pd.DataFrame, src:str, min_days:int=3):
         label = f"<{u}|{nm}>" if u else nm
         top_lines.append(f"{i}. {label} (유지 {int(getattr(r,'days'))}일) {_arrow_points(diff)}")
 
-    # === 브랜드 점유율: 전주 동일 윈도우 비교 ===
+    # 브랜드 비중(전주 동일 윈도우 비교), ↑/↓/—
     b_now = (cur.assign(brand=cur['brand'].fillna('기타'))
                .groupby('brand').size().reset_index(name='count'))
     if not prev.empty:
@@ -277,15 +277,15 @@ def summarize_week(ud:pd.DataFrame, src:str, min_days:int=3):
     b = b.sort_values(['count','delta'], ascending=[False, False]).head(12)
     brand_lines = []
     for r in b.itertuples():
-        sign = "—"
-        if r.delta > 0: sign = f"▲{int(r.delta)}"
-        elif r.delta < 0: sign = f"▼{abs(int(r.delta))}"
+        if r.delta > 0:  sign = f"↑{int(r.delta)}"
+        elif r.delta < 0: sign = f"↓{abs(int(r.delta))}"
+        else:            sign = "—"
         brand_lines.append(f"{r.brand} {int(r.count)}개 {sign}")
 
-    # === IN/OUT: 전일 대비 집합 기준 → 항상 동치 ===
+    # IN/OUT: 전일 대비 집합 기준 → 항상 동치
     in_cnt, out_cnt, daily_avg = _inout_daily(cur, prev, topn, start)
 
-    # 신규 히어로 / 반짝 (raw_name 그대로 표기)
+    # 신규 히어로 / 반짝
     hist_keys = set(hist['key'].unique()) if not hist.empty else set()
     heroes = (pts[~pts['key'].isin(hist_keys)]
                 .merge(latest, on='key', how='left')
@@ -360,10 +360,10 @@ def format_slack_block(src:str, s:dict)->str:
     }
     lines = []
     lines.append(f"📊 주간 리포트 · {title_map.get(src, src)} ({s['range']})")
-    lines.append("🏆 Top10 (raw 제품명)")
+    lines.append("🏆 Top10")                 # '(raw 제품명)' 삭제
     lines.extend(s['top10_lines'] or ["데이터 없음"])
     lines.append("")
-    lines.append("🍞 브랜드 점유율")
+    lines.append("🍞 브랜드 비중")           # '점유율' → '비중'
     lines.extend(s['brand_lines'] or ["데이터 없음"])
     lines.append("")
     lines.append(f"🔁 인앤아웃: {s['inout']}")
