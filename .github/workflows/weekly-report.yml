@@ -1,99 +1,67 @@
-name: Weekly Report → Slack + Google Drive (HTML)
+name: Weekly Report
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 0 * * 1"  # 매주 월요일 09:00 KST (UTC 00:00)
+    - cron: "5 22 * * 0"   # 매주 월요일 KST 오전 7시(UTC 22:05 일요일)
 
 jobs:
   weekly:
     runs-on: ubuntu-latest
-
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Install deps
         run: |
-          sudo apt-get update
-          sudo apt-get install -y jq
-          python -m pip install --upgrade pip
-          pip install pandas google-api-python-client google-auth-httplib2 google-auth-oauthlib
+          python -m pip install -U pip
+          pip install pandas google-auth google-auth-oauthlib google-api-python-client tzdata jq
 
-      # 1) (필요 시) 구글 드라이브에서 일일 CSV 받기
-      - name: Fetch daily CSVs from Google Drive
-        env:
-          GOOGLE_CLIENT_ID:     ${{ secrets.GOOGLE_CLIENT_ID }}
-          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
-          GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
-          GDRIVE_FOLDER_ID:     ${{ secrets.GDRIVE_FOLDER_ID }}
-        run: |
-          mkdir -p data/daily
-          python scripts/fetch_from_gdrive.py || true
-          echo "== data/daily =="
-          ls -al data/daily || true
+      # (선택) 구글 드라이브에서 일일 CSV 내려받는 스텝이 따로 있다면 여기서 호출하세요.
+      # - name: Fetch daily CSVs from Google Drive (optional)
+      #   run: python scripts/fetch_from_gdrive.py
 
-      # 2) 소스별 주간 리포트(슬랙 txt & 요약 json) 생성
-      - name: Generate weekly reports (all sources)
-        env:
-          DATA_DIR: ./data/daily
-          MIN_DAYS: 3
+      - name: Generate weekly report (per source)
         run: |
-          for SRC in oy_kor oy_global amazon_us qoo10_jp daiso_kr; do
-            echo ">>> generate $SRC"
-            python scripts/weekly_report_plus.py \
-              --src "$SRC" \
-              --split \
-              --data-dir "$DATA_DIR" \
-              --min-days $MIN_DAYS || true
-            # 파일이 없으면 기본값 생성(슬랙/HTML/메일 안전)
-            [ -f "slack_${SRC}.txt" ] || echo "데이터 없음" > "slack_${SRC}.txt"
-            [ -f "weekly_summary_${SRC}.json" ] || echo '{"range":"데이터 없음"}' > "weekly_summary_${SRC}.json"
+          python scripts/weekly_report_plus.py --src all --data-dir ./data/daily
+
+      - name: Ensure report files exist
+        run: |
+          ls -al
+          for f in oy_kor oy_global amazon_us qoo10_jp daiso_kr; do
+            test -f "slack_${f}.txt" || echo "경고: slack_${f}.txt 없음"
+            test -f "weekly_summary_${f}.json" || echo "경고: weekly_summary_${f}.json 없음"
           done
 
-      # 3) 슬랙 전송 (섹션별 순차 전송)
       - name: Post to Slack
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: |
-          # 시크릿 없으면 조용히 스킵
           if [ -z "${SLACK_WEBHOOK_URL:-}" ]; then
             echo "No SLACK_WEBHOOK_URL; skip Slack posting."
             exit 0
           fi
-
           post() {
             BODY=$(jq -Rs . < "$1")
             curl -sS -X POST -H 'Content-type: application/json' \
               --data "{\"text\": ${BODY} }" "$SLACK_WEBHOOK_URL" > /dev/null
           }
-
-          for f in \
-            slack_oy_kor.txt \
-            slack_oy_global.txt \
-            slack_amazon_us.txt \
-            slack_qoo10_jp.txt \
-            slack_daiso_kr.txt
-          do
-            if [ -f "$f" ]; then
-              post "$f"
-            else
-              echo "skip $f (not found)"
-            fi
+          for f in slack_oy_kor.txt slack_oy_global.txt slack_amazon_us.txt slack_qoo10_jp.txt slack_daiso_kr.txt; do
+            [ -f "$f" ] && post "$f" || echo "skip $f (not found)"
           done
 
-
-      # 4) HTML 합본 생성
       - id: build_html
+        name: Build HTML
         run: |
           HTML_FILE=$(python scripts/build_html_report.py)
-          echo "html=$HTML_FILE" >> "$GITHUB_OUTPUT"
-          echo "built: $HTML_FILE"
+          echo "html=${HTML_FILE}" >> $GITHUB_OUTPUT
+          echo "Built: ${HTML_FILE}"
 
-      # 5) Google Drive 업서트(파일명: weekly_YYYY_MM_DD_YYYY_MM_DD.html)
       - name: Upload HTML to Google Drive
         env:
           GOOGLE_CLIENT_ID:     ${{ secrets.GOOGLE_CLIENT_ID }}
@@ -101,4 +69,43 @@ jobs:
           GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
           GDRIVE_FOLDER_ID:     ${{ secrets.GDRIVE_FOLDER_ID }}
         run: |
-          python scripts/upload_to_gdrive.py "${{ steps.build_html.outputs.html }}"
+          python - << 'PY'
+          import os, sys, json
+          from google.oauth2.credentials import Credentials
+          from googleapiclient.discovery import build
+          from googleapiclient.http import MediaFileUpload
+
+          cid  = os.environ.get("GOOGLE_CLIENT_ID")
+          csec = os.environ.get("GOOGLE_CLIENT_SECRET")
+          rtok = os.environ.get("GOOGLE_REFRESH_TOKEN")
+          folder_id = os.environ.get("GDRIVE_FOLDER_ID")
+          html = os.environ.get("HTML")
+
+          if not html:
+            # GitHub outputs 통해 전달
+            html = os.popen("echo ${{ steps.build_html.outputs.html }}").read().strip()
+
+          if not all([cid, csec, rtok, folder_id, html]) or not os.path.exists(html):
+            print("Skip GDrive upload (missing creds or file).")
+            sys.exit(0)
+
+          creds = Credentials(
+              None,
+              refresh_token=rtok,
+              token_uri="https://oauth2.googleapis.com/token",
+              client_id=cid,
+              client_secret=csec,
+              scopes=["https://www.googleapis.com/auth/drive.file"]
+          )
+          service = build("drive", "v3", credentials=creds)
+          media = MediaFileUpload(html, mimetype="text/html", resumable=True)
+          file_metadata = {"name": os.path.basename(html), "parents": [folder_id]}
+          r = service.files().create(body=file_metadata, media_body=media, fields="id,name").execute()
+          print("Uploaded:", r)
+          PY
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: weekly-html
+          path: ${{ steps.build_html.outputs.html }}
