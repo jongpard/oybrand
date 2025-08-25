@@ -1,74 +1,59 @@
-name: Weekly Report
+name: Weekly Report → Slack + Google Drive
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 22 * * 0"    # 월요일 오전 7시 KST(= 일요일 22:00 UTC)
-
-env:
-  PYTHON_VERSION: "3.11"
-  DATA_DIR: "./data/daily"
-  SOURCES: "oy_kor,oy_global,amazon_us,qoo10_jp,daiso_kr"
+    - cron: "0 0 * * 1"  # 매주 월요일 09:00 KST (UTC 00:00)
 
 jobs:
   weekly:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        src: [oy_kor, oy_global, amazon_us, qoo10_jp, daiso_kr]
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Install deps
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python deps
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt || true
-          pip install pandas numpy python-dateutil tzdata six
+          pip install pandas google-api-python-client google-auth-httplib2 google-auth-oauthlib
 
-      # (선택) 구글드라이브에서 일일 CSV 내려받는 단계가 있으면 유지
-      - name: Fetch daily CSVs from Google Drive (optional)
+      - name: Generate weekly report
+        env:
+          DATA_DIR: ./data/daily
+          MIN_DAYS: 3
+          FLASH_MAX_DAYS: 2
+        run: |
+          python scripts/weekly_report_plus.py \
+            --src ${{ matrix.src }} \
+            --split \
+            --data-dir "$DATA_DIR" \
+            --min-days $MIN_DAYS
+
+      - name: Upload to Google Drive
         env:
           GOOGLE_CLIENT_ID:     ${{ secrets.GOOGLE_CLIENT_ID }}
           GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
           GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
           GDRIVE_FOLDER_ID:     ${{ secrets.GDRIVE_FOLDER_ID }}
         run: |
-          python scripts/fetch_from_gdrive.py || true
+          python scripts/upload_to_gdrive.py \
+            slack_${{ matrix.src }}.txt \
+            weekly_summary_${{ matrix.src }}.json
 
-      - name: Quick scan (optional)
-        run: |
-          python scripts/check_daily_scan.py || true
-
-      - name: Run weekly per source (split)
-        env:
-          DATA_DIR: ${{ env.DATA_DIR }}
-        run: |
-          python scripts/weekly_report_plus.py --data-dir "$DATA_DIR" --split \
-            --src oy_kor oy_global amazon_us qoo10_jp daiso_kr
-
-      # ★★ 소스별 개별 슬랙 전송 ★★
-      - name: Post to Slack per source
+      - name: Send to Slack
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-          SOURCES: ${{ env.SOURCES }}
         run: |
-          set -e
-          IFS=',' read -ra S <<< "$SOURCES"
-          for SRC in "${S[@]}"; do
-            FILE="slack_${SRC}.txt"
-            if [[ -s "$FILE" ]]; then
-              payload=$(jq -Rs --arg t "$(cat "$FILE")" '{text:$t}')
-              curl -sS -X POST -H 'Content-type: application/json' --data "$payload" "$SLACK_WEBHOOK_URL" >/dev/null
-              echo "posted: $FILE"
-            else
-              payload=$(jq -n --arg t "주간 리포트 생성 실패(본문 없음) - $SRC" '{text:$t}')
-              curl -sS -X POST -H 'Content-type: application/json' --data "$payload" "$SLACK_WEBHOOK_URL" >/dev/null
-              echo "empty: $FILE"
-            fi
-          done
-
-      - name: Save JSON artifacts (optional)
-        uses: actions/upload-artifact@v4
-        with:
-          name: weekly-json
-          path: |
-            weekly_summary_*.json
+          # 파일 내용을 안전하게 JSON 문자열로 인코딩한 뒤 Webhook으로 전송
+          BODY=$(cat slack_${{ matrix.src }}.txt | jq -Rs .)
+          curl -sS -X POST -H 'Content-type: application/json' \
+            --data "{\"text\": $BODY}" \
+            "$SLACK_WEBHOOK_URL"
