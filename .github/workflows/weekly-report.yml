@@ -49,10 +49,7 @@ jobs:
           GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
           GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
         run: |
-          if [ -z "${GDRIVE_FOLDER_ID}" ]; then
-            echo "[GDRIVE] GOOGLE_* / GDRIVE_FOLDER_ID 시크릿을 확인하세요."; exit 1
-          fi
-          python scripts/fetch_from_gdrive.py || true  # 없으면 스킵
+          python scripts/fetch_from_gdrive.py || true
 
       - name: Quick scan (optional)
         run: |
@@ -62,7 +59,6 @@ jobs:
       - name: Generate weekly summary (per source)
         run: |
           python scripts/weekly_report_plus.py --src all --data-dir "${DATA_DIR}"
-        # weekly_summary.json 생성
 
       - name: Build Slack texts
         run: python scripts/format_slack.py
