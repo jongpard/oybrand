@@ -3,19 +3,23 @@ name: Weekly Report
 on:
   workflow_dispatch:
   schedule:
-    # 매주 월요일 KST 03:30 (UTC 일 18:30)
-    - cron: '30 18 * * 0'
+    # 매주 월요일 07:00 KST (일 22:00 UTC)
+    - cron: "0 22 * * 0"
 
-env:
-  PYTHON_VERSION: '3.11'
-  DATA_DIR: ./data/daily
-  DIST_DIR: ./dist
+concurrency:
+  group: weekly-report
+  cancel-in-progress: false
+
+permissions:
+  contents: read
 
 jobs:
   weekly:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
+
+    env:
+      DATA_DIR: ./data/daily
+      DIST_DIR: ./dist
 
     steps:
       - name: Checkout
@@ -24,7 +28,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: ${{ env.PYTHON_VERSION }}
+          python-version: "3.11"
 
       - name: Install deps
         run: |
@@ -33,78 +37,73 @@ jobs:
 
       - name: Ensure data/output dirs
         run: |
-          mkdir -p "${DATA_DIR}" "${DIST_DIR}"
+          mkdir -p "${DATA_DIR}"
+          mkdir -p "${DIST_DIR}"
 
-      # === (선택) 구글 드라이브에서 일일 CSV 내려받기 ===
+      # (옵션) 구글 드라이브에서 일일 CSV 가져오기
       - name: Fetch daily CSVs from Google Drive (optional)
+        if: ${{ secrets.GDRIVE_FOLDER_ID != '' && secrets.GOOGLE_CLIENT_ID != '' && secrets.GOOGLE_CLIENT_SECRET != '' && secrets.GOOGLE_REFRESH_TOKEN != '' }}
         env:
           GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
           GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
           GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
           GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
         run: |
-          if [ -z "${GDRIVE_FOLDER_ID}" ] || [ -z "${GOOGLE_CLIENT_ID}" ] || \
-             [ -z "${GOOGLE_CLIENT_SECRET}" ] || [ -z "${GOOGLE_REFRESH_TOKEN}" ]; then
-            echo "[GDRIVE] GOOGLE_* / GDRIVE_FOLDER_ID 시크릿이 비어 있음 → skip"
-            exit 0
+          if [ -z "${GDRIVE_FOLDER_ID}" ]; then
+            echo "[GDRIVE] GOOGLE_* / GDRIVE_FOLDER_ID 시크릿을 확인하세요."; exit 1
           fi
-          python scripts/fetch_from_gdrive.py
+          python scripts/fetch_from_gdrive.py || true  # 없으면 스킵
 
-      # === (선택) 일일 데이터 간단 스캔 ===
       - name: Quick scan (optional)
         run: |
-          python scripts/check_daily_scan.py || true
+          echo "== oy_global =="
+          ls -1 "${DATA_DIR}" | sed -n '1,10p' || true
 
-      # === 주간 집계 생성(소스별 텍스트/JSON 등) ===
-      - name: Generate weekly report (per source)
+      - name: Generate weekly summary (per source)
         run: |
           python scripts/weekly_report_plus.py --src all --data-dir "${DATA_DIR}"
+        # weekly_summary.json 생성
 
-      # === (선택) 슬랙 전송: 소스별로 개별 메시지 ===
+      - name: Build Slack texts
+        run: python scripts/format_slack.py
+
       - name: Send to Slack (optional)
+        if: ${{ secrets.SLACK_WEBHOOK_URL != '' }}
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: |
-          if [ -z "${SLACK_WEBHOOK_URL}" ]; then
-            echo "[SLACK] SLACK_WEBHOOK_URL 비어 있음 → skip"
-            exit 0
-          fi
-          set -e
-          post(){ 
-            BODY=$(jq -Rs . < "$1")
-            curl -sS -X POST -H 'Content-type: application/json' \
-              --data "{\"text\": ${BODY}}" "${SLACK_WEBHOOK_URL}" >/dev/null
+          post() {
+            local f="$1"
+            if [ -f "$f" ]; then
+              BODY="$(jq -Rs . < "$f")"
+              curl -sS -X POST -H 'Content-type: application/json' \
+                --data "{\"text\":${BODY}}" "$SLACK_WEBHOOK_URL" >/dev/null
+              echo "posted: $f"
+            fi
           }
-          post slack_oy_kor.txt
-          post slack_oy_global.txt
-          post slack_amazon_us.txt
-          post slack_qoo10_jp.txt
-          post slack_daiso_kr.txt
+          post dist/slack_oy_kor.txt
+          post dist/slack_oy_global.txt
+          post dist/slack_amazon_us.txt
+          post dist/slack_qoo10_jp.txt
+          post dist/slack_daiso_kr.txt
 
-      # === HTML 리포트 생성(하이퍼링크 포함) ===
       - name: Build HTML
         run: |
-          python scripts/build_html_report.py --out "${DIST_DIR}/weekly_report.html"
-          ls -l "${DIST_DIR}"
+          python scripts/build_html_report.py
+          echo "== HTML files =="; ls -l dist
 
-      # === (선택) 구글 드라이브 업로드 ===
       - name: Upload HTML to Google Drive (optional)
+        if: ${{ secrets.GDRIVE_FOLDER_ID != '' && secrets.GOOGLE_CLIENT_ID != '' && secrets.GOOGLE_CLIENT_SECRET != '' && secrets.GOOGLE_REFRESH_TOKEN != '' }}
         env:
           GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
           GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
           GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
           GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
         run: |
-          if [ -z "${GDRIVE_FOLDER_ID}" ] || [ -z "${GOOGLE_CLIENT_ID}" ] || \
-             [ -z "${GOOGLE_CLIENT_SECRET}" ] || [ -z "${GOOGLE_REFRESH_TOKEN}" ]; then
-            echo "[GDRIVE] GOOGLE_* / GDRIVE_FOLDER_ID 시크릿이 비어 있음 → skip"
-            exit 0
-          fi
-          python scripts/upload_to_gdrive.py "${DIST_DIR}/weekly_report.html" "${GDRIVE_FOLDER_ID}"
+          python scripts/upload_to_gdrive.py
 
-      # === 산출물 보관 ===
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: weekly-report
-          path: ${{ env.DIST_DIR }}
+          path: dist/*
