@@ -34,45 +34,53 @@ jobs:
           mkdir -p "${DATA_DIR}" "${DIST_DIR}"
 
       # ─────────────────────────────────────────────────────────
-      # Google Drive에서 일일 CSV 가져오기 (선택)
+      # Google Drive 에서 최근 CSV 내려받기 (선택)
       # ─────────────────────────────────────────────────────────
       - name: Fetch daily CSVs from Google Drive (optional)
+        shell: bash
         env:
           GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
         run: |
-          if [ -z "${GDRIVE_FOLDER_ID}" ]; then
-            echo "GDRIVE_FOLDER_ID empty → skip fetch"
-          else
-            python scripts/fetch_from_gdrive.py \
-              --folder "${GDRIVE_FOLDER_ID}" \
-              --out "${DATA_DIR}" \
-              --days 21
+          if [ -z "${GDRIVE_FOLDER_ID:-}" ]; then
+            echo "[GDRIVE] Skip: GDRIVE_FOLDER_ID empty"
+            exit 0
           fi
+          if [ -z "${GOOGLE_CLIENT_ID:-}" ] || [ -z "${GOOGLE_CLIENT_SECRET:-}" ] || [ -z "${GOOGLE_REFRESH_TOKEN:-}" ]; then
+            echo "[GDRIVE] Skip: GOOGLE_* secrets missing"
+            exit 0
+          fi
+          python scripts/fetch_from_gdrive.py \
+            --folder "${GDRIVE_FOLDER_ID}" \
+            --out "${DATA_DIR}" \
+            --days 21
 
-      # (선택) 빠른 스캔 – 파일 유입 확인(에러로 실패하지 않음)
+      # 빠른 스캔(있어도 없어도 됨 / 실패시키지 않음)
       - name: Quick scan (optional)
         run: |
           python scripts/check_daily_scan.py || true
 
       # ─────────────────────────────────────────────────────────
-      # 주간 요약 생성 (섹션별 Slack 텍스트 / 요약 JSON 생성)
+      # 주간 리포트 집계 (섹션별 Slack 텍스트 & 요약 JSON 생성)
       # ─────────────────────────────────────────────────────────
       - name: Generate weekly report (per source)
         run: |
           python scripts/weekly_report_plus.py --src all --data-dir "./${DATA_DIR}"
 
       # ─────────────────────────────────────────────────────────
-      # Slack 전송 (선택, 섹션별 순차) — 셸에서 가드
+      # Slack 전송 (선택) — 시크릿 없으면 조용히 스킵
       # ─────────────────────────────────────────────────────────
       - name: Send to Slack (optional)
+        shell: bash
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: |
-          if [ -z "${SLACK_WEBHOOK_URL}" ]; then
-            echo "SLACK_WEBHOOK_URL empty → skip Slack"
+          if [ -z "${SLACK_WEBHOOK_URL:-}" ]; then
+            echo "[SLACK] Skip: SLACK_WEBHOOK_URL empty"
             exit 0
           fi
-
           post() {
             local f="$1"
             [ -f "$f" ] || return 0
@@ -81,7 +89,6 @@ jobs:
               --data "{\"text\":${BODY}}" "$SLACK_WEBHOOK_URL" >/dev/null
             echo "posted: $f"
           }
-
           post slack_oy_kor.txt
           post slack_oy_global.txt
           post slack_amazon_us.txt
@@ -89,7 +96,7 @@ jobs:
           post slack_daiso_kr.txt
 
       # ─────────────────────────────────────────────────────────
-      # HTML 리포트 생성 (스크립트가 경로를 stdout 으로 반환)
+      # HTML 리포트 생성 (stdout 으로 경로 반환)
       # ─────────────────────────────────────────────────────────
       - name: Build HTML
         id: build_html
@@ -101,27 +108,34 @@ jobs:
           if [ -f "$HTML_FILE" ]; then
             cp "$HTML_FILE" "$TARGET"
           else
-            # 스크립트가 이미 dist 경로로 생성했다면 그 경로 사용
             TARGET="$HTML_FILE"
           fi
           echo "html_file=$TARGET" >> "$GITHUB_OUTPUT"
           echo "HTML_FILE => $TARGET"
 
       # ─────────────────────────────────────────────────────────
-      # Google Drive 업로드 (선택) — 셸에서 가드
+      # Google Drive 업로드 (선택) — 시크릿 없으면 스킵
       # ─────────────────────────────────────────────────────────
       - name: Upload HTML to Google Drive (optional)
+        shell: bash
         env:
           GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
         run: |
-          if [ -z "${GDRIVE_FOLDER_ID}" ]; then
-            echo "GDRIVE_FOLDER_ID empty → skip upload"
-          else
-            python scripts/upload_to_gdrive.py \
-              --file "${{ steps.build_html.outputs.html_file }}" \
-              --folder "${GDRIVE_FOLDER_ID}" \
-              --name "$(date +'%Y_%m_%d')_weekly.html"
+          if [ -z "${GDRIVE_FOLDER_ID:-}" ]; then
+            echo "[GDRIVE] Skip: GDRIVE_FOLDER_ID empty"
+            exit 0
           fi
+          if [ -z "${GOOGLE_CLIENT_ID:-}" ] || [ -z "${GOOGLE_CLIENT_SECRET:-}" ] || [ -z "${GOOGLE_REFRESH_TOKEN:-}" ]; then
+            echo "[GDRIVE] Skip: GOOGLE_* secrets missing"
+            exit 0
+          fi
+          python scripts/upload_to_gdrive.py \
+            --file "${{ steps.build_html.outputs.html_file }}" \
+            --folder "${GDRIVE_FOLDER_ID}" \
+            --name "$(date +'%Y_%m_%d')_weekly.html"
 
       # 다운로드용 아티팩트 업로드
       - name: Upload artifact
