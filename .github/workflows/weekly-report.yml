@@ -20,10 +20,15 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install -U pip
-          pip install pandas google-auth google-auth-oauthlib google-api-python-client tzdata jq
+          pip install pandas google-auth google-auth-oauthlib google-api-python-client tzdata
+          sudo apt-get update
+          sudo apt-get install -y jq   # ← jq는 apt로 설치해야 curl 전송 단계에서 사용 가능
 
-      # (선택) 구글 드라이브에서 일일 CSV 내려받는 스텝이 따로 있다면 여기서 호출하세요.
-      # - name: Fetch daily CSVs from Google Drive (optional)
+      - name: Prepare data dir
+        run: mkdir -p ./data/daily      # ← 폴더 미리 만들어 두기
+
+      # (선택) 구글 드라이브에서 일일 CSV 내려받는 스텝이 있다면 여기
+      # - name: Fetch daily CSVs from Google Drive
       #   run: python scripts/fetch_from_gdrive.py
 
       - name: Generate weekly report (per source)
