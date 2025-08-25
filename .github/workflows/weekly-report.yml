@@ -1,66 +1,89 @@
-# -*- coding: utf-8 -*-
-import os, json, html, re
-from datetime import datetime
+name: Weekly Report → Slack + Google Drive (HTML)
 
-SRC_INFO = [
-    ("oy_kor",    "올리브영 국내 Top100"),
-    ("oy_global", "올리브영 글로벌 Top100"),
-    ("amazon_us", "아마존 US Top100"),
-    ("qoo10_jp",  "큐텐 재팬 뷰티 Top200"),
-    ("daiso_kr",  "다이소몰 뷰티/위생 Top200"),
-]
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 0 * * 1"  # 매주 월요일 09:00 KST (UTC 00:00)
 
-URL_RE = re.compile(r'(https?://[^\s]+)')
+jobs:
+  weekly:
+    runs-on: ubuntu-latest
 
-def read_text(p):
-    return open(p, 'r', encoding='utf-8').read() if os.path.exists(p) else "데이터 없음"
+    steps:
+      - uses: actions/checkout@v4
 
-def find_range():
-    for key, _ in SRC_INFO:
-        p = f"weekly_summary_{key}.json"
-        if os.path.exists(p):
-            try:
-                r = json.load(open(p, "r", encoding="utf-8")).get("range")
-                if r: return r
-            except Exception:
-                pass
-    return datetime.utcnow().strftime("%Y-%m-%d")
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
-def slack_to_html(text: str) -> str:
-    # 1) HTML 이스케이프
-    s = html.escape(text)
-    # 2) *볼드* 변환
-    s = re.sub(r'\*(.+?)\*', r'<b>\1</b>', s)
-    # 3) URL 자동 링크
-    s = URL_RE.sub(lambda m: f'<a href="{m.group(1)}" target="_blank">{m.group(1)}</a>', s)
-    # 4) 개행 보존
-    s = s.replace('\n', '<br>')
-    return s
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+          python -m pip install --upgrade pip
+          pip install pandas google-api-python-client google-auth-httplib2 google-auth-oauthlib
 
-def build_html(range_str: str) -> str:
-    parts = [f"""<!doctype html>
-<html lang="ko"><head>
-<meta charset="utf-8"/>
-<title>주간 리포트 ({html.escape(range_str)})</title>
-<style>
-  body{{font-family:-apple-system,BlinkMacSystemFont,Pretendard,Segoe UI,Roboto,Apple SD Gothic Neo,Malgun Gothic,sans-serif;
-       margin:24px; line-height:1.6; color:#111}}
-  h1{{font-size:22px; margin:0 0 12px}}
-  h2{{font-size:16px; margin:28px 0 8px; border-top:1px solid #eee; padding-top:18px}}
-  .box{{background:#fafafa; border:1px solid #eee; border-radius:10px; padding:14px}}
-</style>
-</head><body>
-<h1>주간 리포트 <small>({html.escape(range_str)})</small></h1>
-"""]
-    for key, title in SRC_INFO:
-        txt = read_text(f"slack_{key}.txt")
-        parts.append(f"<h2>{html.escape(title)}</h2>")
-        parts.append(f'<div class="box">{slack_to_html(txt)}</div>')
-    parts.append("</body></html>")
-    return "\n".join(parts)
+      # 1) (필요 시) 구글 드라이브에서 일일 CSV 받기
+      - name: Fetch daily CSVs from Google Drive
+        env:
+          GOOGLE_CLIENT_ID:     ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+          GDRIVE_FOLDER_ID:     ${{ secrets.GDRIVE_FOLDER_ID }}
+        run: |
+          mkdir -p data/daily
+          python scripts/fetch_from_gdrive.py || true
+          echo "== data/daily =="
+          ls -al data/daily || true
 
-if __name__ == "__main__":
-    r = find_range()
-    fname = ("weekly_" + r.replace("-", "_").replace("__","_") + ".html")
-    open(fname, "w", encoding="utf-8").write(build_html(r))
-    print(fname)
+      # 2) 소스별 주간 리포트(슬랙 txt & 요약 json) 생성
+      - name: Generate weekly reports (all sources)
+        env:
+          DATA_DIR: ./data/daily
+          MIN_DAYS: 3
+        run: |
+          for SRC in oy_kor oy_global amazon_us qoo10_jp daiso_kr; do
+            echo ">>> generate $SRC"
+            python scripts/weekly_report_plus.py \
+              --src "$SRC" \
+              --split \
+              --data-dir "$DATA_DIR" \
+              --min-days $MIN_DAYS || true
+            # 파일이 없으면 기본값 생성(슬랙/HTML/메일 안전)
+            [ -f "slack_${SRC}.txt" ] || echo "데이터 없음" > "slack_${SRC}.txt"
+            [ -f "weekly_summary_${SRC}.json" ] || echo '{"range":"데이터 없음"}' > "weekly_summary_${SRC}.json"
+          done
+
+      # 3) 슬랙 전송 (섹션별 순차 전송)
+      - name: Post to Slack
+        if: ${{ secrets.SLACK_WEBHOOK_URL != '' }}
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          post(){
+            BODY=$(jq -Rs . < "$1")
+            curl -sS -X POST -H 'Content-type: application/json' \
+              --data "{\"text\": ${BODY} }" "$SLACK_WEBHOOK_URL" > /dev/null
+          }
+          post slack_oy_kor.txt
+          post slack_oy_global.txt
+          post slack_amazon_us.txt
+          post slack_qoo10_jp.txt
+          post slack_daiso_kr.txt
+
+      # 4) HTML 합본 생성
+      - id: build_html
+        run: |
+          HTML_FILE=$(python scripts/build_html_report.py)
+          echo "html=$HTML_FILE" >> "$GITHUB_OUTPUT"
+          echo "built: $HTML_FILE"
+
+      # 5) Google Drive 업서트(파일명: weekly_YYYY_MM_DD_YYYY_MM_DD.html)
+      - name: Upload HTML to Google Drive
+        env:
+          GOOGLE_CLIENT_ID:     ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+          GDRIVE_FOLDER_ID:     ${{ secrets.GDRIVE_FOLDER_ID }}
+        run: |
+          python scripts/upload_to_gdrive.py "${{ steps.build_html.outputs.html }}"
