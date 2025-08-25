@@ -1,4 +1,4 @@
-name: Weekly Report → Slack + Google Drive
+name: Weekly Report → Email
 
 on:
   workflow_dispatch:
@@ -20,12 +20,12 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install Python deps
+      - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install pandas google-api-python-client google-auth-httplib2 google-auth-oauthlib
+          pip install pandas
 
-      - name: Generate weekly report
+      - name: Generate weekly report (per source)
         env:
           DATA_DIR: ./data/daily
           MIN_DAYS: 3
@@ -37,23 +37,43 @@ jobs:
             --data-dir "$DATA_DIR" \
             --min-days $MIN_DAYS
 
-      - name: Upload to Google Drive
-        env:
-          GOOGLE_CLIENT_ID:     ${{ secrets.GOOGLE_CLIENT_ID }}
-          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
-          GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
-          GDRIVE_FOLDER_ID:     ${{ secrets.GDRIVE_FOLDER_ID }}
+      # 메타(제목/기간) 추출
+      - id: meta
         run: |
-          python scripts/upload_to_gdrive.py \
-            slack_${{ matrix.src }}.txt \
-            weekly_summary_${{ matrix.src }}.json
+          RANGE=$(jq -r '.range // "데이터 없음"' weekly_summary_${{ matrix.src }}.json)
+          case "${{ matrix.src }}" in
+            oy_kor)    TITLE="올리브영 국내 Top100" ;;
+            oy_global) TITLE="올리브영 글로벌 Top100" ;;
+            amazon_us) TITLE="아마존 US Top100" ;;
+            qoo10_jp)  TITLE="큐텐 재팬 뷰티 Top200" ;;
+            daiso_kr)  TITLE="다이소몰 뷰티/위생 Top200" ;;
+          esac
+          echo "range=$RANGE" >> $GITHUB_OUTPUT
+          echo "title=$TITLE" >> $GITHUB_OUTPUT
 
-      - name: Send to Slack
-        env:
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      # 본문(슬랙 텍스트 파일) 읽기
+      - id: body
         run: |
-          # 파일 내용을 안전하게 JSON 문자열로 인코딩한 뒤 Webhook으로 전송
-          BODY=$(cat slack_${{ matrix.src }}.txt | jq -Rs .)
-          curl -sS -X POST -H 'Content-type: application/json' \
-            --data "{\"text\": $BODY}" \
-            "$SLACK_WEBHOOK_URL"
+          echo "text<<'EOF'" >> $GITHUB_OUTPUT
+          if [ -f slack_${{ matrix.src }}.txt ]; then
+            cat slack_${{ matrix.src }}.txt >> $GITHUB_OUTPUT
+          else
+            echo "데이터 없음" >> $GITHUB_OUTPUT
+          fi
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Send report via Email
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.SMTP_HOST }}
+          server_port: ${{ secrets.SMTP_PORT }}
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          from: ${{ secrets.MAIL_FROM }}
+          to: ${{ secrets.MAIL_TO }}
+          subject: "[주간 리포트] ${{ steps.meta.outputs.title }} (${{ steps.meta.outputs.range }})"
+          content_type: text/plain; charset=UTF-8
+          body: ${{ steps.body.outputs.text }}
+          attachments: |
+            weekly_summary_${{ matrix.src }}.json
+            slack_${{ matrix.src }}.txt
