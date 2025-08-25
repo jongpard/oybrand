@@ -20,8 +20,10 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install deps
+      - name: Install tools
         run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
           python -m pip install --upgrade pip
           pip install pandas
 
@@ -75,13 +77,15 @@ jobs:
             echo "title=$TITLE"
           } >> "$GITHUB_OUTPUT"
 
+      # ✅ 멀티라인 output을 '고유 구분자'로 안전하게 기록
       - id: body
         shell: bash
         run: |
+          DELIM="BODY_$(date +%s)_$RANDOM"
           {
-            echo 'text<<EOF'
+            echo "text<<$DELIM"
             cat "slack_${{ matrix.src }}.txt"
-            echo 'EOF'
+            echo "$DELIM"
           } >> "$GITHUB_OUTPUT"
 
       - name: Send report via Email
