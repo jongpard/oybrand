@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-import os, json, html
+import os, json, html, re
 from datetime import datetime
 
 SRC_INFO = [
@@ -10,63 +10,57 @@ SRC_INFO = [
     ("daiso_kr",  "다이소몰 뷰티/위생 Top200"),
 ]
 
-def read_text(path: str) -> str:
-    if not os.path.exists(path):
-        return "데이터 없음"
-    with open(path, "r", encoding="utf-8") as f:
-        return f.read()
+URL_RE = re.compile(r'(https?://[^\s]+)')
 
-def find_range() -> str:
-    """weekly_summary_{src}.json 중 존재하는 첫 파일의 range를 제목/파일명에 사용."""
+def read_text(p):
+    return open(p, 'r', encoding='utf-8').read() if os.path.exists(p) else "데이터 없음"
+
+def find_range():
     for key, _ in SRC_INFO:
         p = f"weekly_summary_{key}.json"
         if os.path.exists(p):
             try:
                 r = json.load(open(p, "r", encoding="utf-8")).get("range")
-                if r:
-                    return r  # 예: "2025-08-18-2025-08-24"
+                if r: return r
             except Exception:
                 pass
-    # fallback: 오늘 날짜
-    today = datetime.utcnow().strftime("%Y-%m-%d")
-    return f"{today}"
+    return datetime.utcnow().strftime("%Y-%m-%d")
+
+def slack_to_html(text: str) -> str:
+    # 1) HTML 이스케이프
+    s = html.escape(text)
+    # 2) *볼드* 변환
+    s = re.sub(r'\*(.+?)\*', r'<b>\1</b>', s)
+    # 3) URL 자동 링크
+    s = URL_RE.sub(lambda m: f'<a href="{m.group(1)}" target="_blank">{m.group(1)}</a>', s)
+    # 4) 개행 보존
+    s = s.replace('\n', '<br>')
+    return s
 
 def build_html(range_str: str) -> str:
-    parts = []
-    parts.append(f"""<!doctype html>
+    parts = [f"""<!doctype html>
 <html lang="ko"><head>
 <meta charset="utf-8"/>
 <title>주간 리포트 ({html.escape(range_str)})</title>
 <style>
-  body{{font-family:-apple-system,BlinkMacSystemFont,Pretendard,Segoe UI,Roboto,Apple SD Gothic Neo,Malgun Gothic,sans-serif; 
-       margin:24px; line-height:1.5; color:#111}}
-  h1{{font-size:20px; margin:0 0 12px}}
+  body{{font-family:-apple-system,BlinkMacSystemFont,Pretendard,Segoe UI,Roboto,Apple SD Gothic Neo,Malgun Gothic,sans-serif;
+       margin:24px; line-height:1.6; color:#111}}
+  h1{{font-size:22px; margin:0 0 12px}}
   h2{{font-size:16px; margin:28px 0 8px; border-top:1px solid #eee; padding-top:18px}}
   .box{{background:#fafafa; border:1px solid #eee; border-radius:10px; padding:14px}}
-  pre{{white-space:pre-wrap; word-break:break-word; margin:0; font:13px/1.6 ui-monospace, Menlo, Consolas, monospace}}
-  .meta{{color:#666; font-size:12px; margin-bottom:16px}}
 </style>
 </head><body>
-<h1>주간 리포트 <span class="meta">({html.escape(range_str)})</span></h1>
-""")
+<h1>주간 리포트 <small>({html.escape(range_str)})</small></h1>
+"""]
     for key, title in SRC_INFO:
         txt = read_text(f"slack_{key}.txt")
-        # Slack 본문 그대로 보존(이모지/개행 포함)
-        txt = html.escape(txt)
         parts.append(f"<h2>{html.escape(title)}</h2>")
-        parts.append('<div class="box"><pre>')
-        parts.append(txt)
-        parts.append("</pre></div>")
-
+        parts.append(f'<div class="box">{slack_to_html(txt)}</div>')
     parts.append("</body></html>")
     return "\n".join(parts)
 
 if __name__ == "__main__":
-    range_str = find_range()
-    # 파일명: weekly_YYYY-MM-DD_YYYY-MM-DD.html (range가 한 날짜면 그 날짜만)
-    fname = ("weekly_" + range_str.replace("-", "_").replace("__", "_") + ".html").replace("__", "_")
-    html_str = build_html(range_str)
-    with open(fname, "w", encoding="utf-8") as f:
-        f.write(html_str)
-    # CI에서 path를 받기 위해 파일명만 출력
+    r = find_range()
+    fname = ("weekly_" + r.replace("-", "_").replace("__","_") + ".html")
+    open(fname, "w", encoding="utf-8").write(build_html(r))
     print(fname)
