@@ -38,7 +38,7 @@ COLS = {
     'pdNo':        ['pdNo','pdno','상품번호','상품코드'],
 }
 
-# 키워드 룰
+# --------- 키워드 룰 ---------
 KW_PRODUCT = {
     '패드': r'(패드|pad)',
     '마스크팩': r'(마스크팩|마스크|sheet\s*mask|mask\s*pack)',
@@ -59,11 +59,19 @@ KW_EFFICACY = {
     '각질/필링': r'(각질|필링|peel|AHA|BHA|PHA)',
     '주름': r'(주름|wrinkle|anti[-\s]?aging)',
 }
+# 👉 마케팅 키워드: 세부 항목 **전부 분리**(올영픽/PICK, 특가 포함)
 KW_MARKETING = {
-    '기획/세트': r'(기획|세트|set|kit|bundle)',
-    '1+1/증정': r'(1\+1|2\+1|증정|증량|덤)',
-    '한정/NEW': r'(한정|리미티드|limited|NEW|new\b|신상)',
-    '쿠폰/딜': r'(쿠폰|coupon|딜|deal|특가|sale|세일|event|프로모션|promotion)',
+    '올영픽/PICK': r'(올영픽|\bPICK\b)',
+    '기획':        r'(?<!더블)\s?기획',
+    '세트':        r'\b세트\b|set\b|kit\b|bundle\b',
+    '1+1':         r'\b1\+1\b|\b2\+1\b',
+    '증정':        r'(증정|증량|덤)',
+    '한정':        r'(한정|리미티드|limited)',
+    'NEW':         r'\bNEW\b|신상',
+    '쿠폰':        r'(쿠폰|coupon)',
+    '딜':          r'(딜|deal)',
+    '특가':        r'(특가)',
+    '세일':        r'(sale|세일|event|행사)',
 }
 # 성분 키워드
 KW_INGREDIENT = {
@@ -82,7 +90,7 @@ KW_INGREDIENT = {
     '징크옥사이드': r'(징크\s*옥사이드|zinc\s*oxide)',
 }
 
-# 카테고리 매핑(간단 룰)
+# --------- 카테고리 매핑 ---------
 CATEGORY_RULES = [
     ("마스크팩", r"(마스크팩|팩|sheet\s*mask|mask\s*pack)"),
     ("선케어", r"(선크림|자외선|sun\s*cream|sunscreen|uv)"),
@@ -168,7 +176,7 @@ def fmt_money(v, src):
     if cur == 'JPY':  return f"¥{v:,.0f}"
     return f"₩{v:,.0f}"
 
-# 프로모션/인플루언서
+# 프로모션 판정(메시지용)
 PROMO_RE = re.compile(
     r"(올영픽|특가|기획|증정|세일|sale|event|행사|한정|리미티드|1\+1|2\+1|더블\s*기획|증량|쿠폰|coupon|deal|딜|gift|bundle|promotion|NEW\b|신상)",
     re.IGNORECASE
@@ -182,7 +190,7 @@ def is_promo(name:str)->bool:
     return bool(PROMO_RE.search(n))
 
 def extract_influencers_dynamic(name:str):
-    """영어 pick/PICK 앞 단어 or ×/with/콜라보 패턴만 인플로 인식"""
+    """영어 pick/PICK 앞 단어 or ×/with/콜라보 패턴만 인플로 인식 (블랙리스트 제외)"""
     if not name: return set()
     t = str(name)
     out = set()
@@ -343,7 +351,7 @@ def summarize_week(ud:pd.DataFrame, src:str, min_days:int=3):
         sign = f"↑{round(r.delta,1)}" if r.delta>0 else (f"↓{abs(round(r.delta,1))}" if r.delta<0 else "—")
         brand_lines.append(f"{r.brand} {round(r.now,1)}개/일 ({sign})")
 
-    # IN(교체 수) – OUT은 표시하지 않음
+    # IN(교체 수) – OUT은 표시하지 않음 → "일평균 n.n개"
     days = sorted(cur_base['day'].unique())
     prev_days_set = set(prev_base['day'].unique())
     total_in = 0
@@ -400,27 +408,35 @@ def summarize_week(ud:pd.DataFrame, src:str, min_days:int=3):
     total_uniq = len(uniq)
     cat_pairs = [f"{c} {round(n*100/total_uniq,1)}%" for c,n in cat_cnt.head(5).items()]
 
-    # 키워드(유니크 제품 기준 %)
+    # --- 키워드(유니크 제품 기준 %) ---
     def share_unique(base, rules):
         keys = base.sort_values('date').drop_duplicates('key')[['key','product']]
         total = len(keys); cnt = Counter()
         for row in keys.itertuples():
-            name=getattr(row,'product') or ''
-            for label,pat in rules.items():
+            name = getattr(row, 'product') or ''
+            for label, pat in rules.items():
                 if re.search(pat, name, re.IGNORECASE):
-                    cnt[label]+=1
-        if total==0: return []
-        return [f"{k} {round(v*100/total,1)}%" for k,v in cnt.most_common(6)]
+                    cnt[label] += 1
+        if total == 0: return []
+        return [f"{k} {round(v*100/total, 1)}%" for k, v in cnt.most_common(10)]
+
+    def _kw_line(title, items):
+        return f"*• {title}:* " + ", ".join(items) if items else None
 
     kw_lines=[]
-    p_items=share_unique(cur_base, KW_PRODUCT)
-    e_items=share_unique(cur_base, KW_EFFICACY)
-    m_items=share_unique(cur_base, KW_MARKETING)
-    ing_items=share_unique(cur_base, KW_INGREDIENT)
-    if p_items: kw_lines.append("• 제품형태: " + ", ".join(p_items))
-    if e_items: kw_lines.append("• 효능: " + ", ".join(e_items))
-    if m_items: kw_lines.append("• 마케팅: " + ", ".join(m_items))
-    if ing_items: kw_lines.append("• 성분: " + ", ".join(ing_items))
+    p_items = share_unique(cur_base, KW_PRODUCT)
+    e_items = share_unique(cur_base, KW_EFFICACY)
+    m_items = share_unique(cur_base, KW_MARKETING)
+    ing_items = share_unique(cur_base, KW_INGREDIENT)
+
+    for ttl, items in [
+        ("제품형태", p_items),
+        ("효능",     e_items),
+        ("마케팅",   m_items),
+        ("성분",     ing_items),
+    ]:
+        line = _kw_line(ttl, items)
+        if line: kw_lines.append(line)
 
     # 인플루언서(올리브영 국내만)
     if src=='oy_kor':
@@ -428,7 +444,8 @@ def summarize_week(ud:pd.DataFrame, src:str, min_days:int=3):
         for names in cur_base['infl'].dropna():
             for n in names: icnt[n]+=1
         infl_names=[n for n,_ in icnt.most_common(8)]
-        if infl_names: kw_lines.append("• 인플루언서: " + ", ".join(infl_names))
+        if infl_names:
+            kw_lines.append("*• 인플루언서:* " + ", ".join(infl_names))
 
     # 가격대 버킷(소스별)
     def price_bucket(src, med):
@@ -458,7 +475,7 @@ def summarize_week(ud:pd.DataFrame, src:str, min_days:int=3):
         return "4만+"
     price_bucket_txt = price_bucket(src, med_price)
 
-    # 인사이트 (중복 제거: TopN 등극 SKU는 제외)
+    # 인사이트 (중복 제거: 등극 SKU 문구 제거, 유지 평균만)
     keep_mean = round(float(pts_all['days'].mean()), 1) if not pts_all.empty else 0.0
     keep_med  = int(pts_stable['days'].median()) if not pts_stable.empty else 0
     g_up=b.sort_values('delta',ascending=False).head(1)
@@ -470,7 +487,7 @@ def summarize_week(ud:pd.DataFrame, src:str, min_days:int=3):
         diff=round(disc_promo-disc_non,2)
         if abs(diff)>=2.0: promo_effect=f"프로모션 평균 할인율이 일반 대비 {('+' if diff>0 else '')}{diff}%p"
 
-    insights=[f"Top {topn} 유지 평균 {keep_mean}일"]  # ← 요청대로 표기
+    insights=[f"Top {topn} 유지 평균 {keep_mean}일"]
     if up_txt or dn_txt:
         bits=[]
         if up_txt: bits.append("상승 "+up_txt)
@@ -505,48 +522,30 @@ def summarize_week(ud:pd.DataFrame, src:str, min_days:int=3):
 
 # --------- 슬랙 포맷 ---------
 def format_slack_block(src:str, s:dict)->str:
-    title_map = {
-        'oy_kor': "올리브영 국내 Top100",
-        'oy_global': "올리브영 글로벌 Top100",
-        'amazon_us': "아마존 US Top100",
-        'qoo10_jp': "큐텐 재팬 뷰티 Top200",
-        'daiso_kr': "다이소몰 뷰티/위생 Top200",
-    }
+    title_map={'oy_kor':"올리브영 국내 Top100",'oy_global':"올리브영 글로벌 Top100",
+               'amazon_us':"아마존 US Top100",'qoo10_jp':"큐텐 재팬 뷰티 Top200",'daiso_kr':"다이소몰 뷰티/위생 Top200"}
+    L=[]
+    # 제목 볼드
+    L.append(f"*📊 주간 리포트 · {title_map.get(src,src)} ({s['range']})*")
 
-    L = []
-    # 제목
-    L.append(f"*📊 주간 리포트 · {title_map.get(src, src)} ({s['range']})*")
-
-    # 소제목들 볼드
-    L.append(f"*🏆 Top10*")
-    L.extend(s.get('top10_lines') or ["데이터 없음"])
-    L.append("")
-
-    L.append(f"*🍞 브랜드 개수(일평균)*")
-    L.extend(s.get('brand_lines') or ["데이터 없음"])
-    L.append("")
-
-    # 인앤아웃(간소화)
+    # 소제목 볼드
+    L.append(f"*🏆 Top10*"); L.extend(s.get('top10_lines') or ["데이터 없음"]); L.append("")
+    L.append(f"*🍞 브랜드 개수(일평균)*"); L.extend(s.get('brand_lines') or ["데이터 없음"]); L.append("")
     L.append(f"*🔁 인앤아웃(교체):* {s.get('inout','비교 기준 없음')}")
-
-    # 히어로/반짝 + 기준 설명
     L.append("*🆕 신규 히어로(3일 이상 랭크 유지):* " + (", ".join(s.get('heroes') or []) if s.get('heroes') else "없음"))
     L.append("*✨ 반짝 아이템(2일 이내 랭크 아웃):* " + (", ".join(s.get('flash')  or []) if s.get('flash')  else "없음"))
 
-    # 카테고리
     if s.get('cat_top5'):
         L.append("*📈 카테고리 상위:* " + " · ".join(s['cat_top5']))
 
-    # 주간 키워드 분석
     if s.get('kw_lines'):
         L.append("*🔎 주간 키워드 분석*")
         L.extend(s['kw_lines'])
 
-    # 가격/할인(소제목 + 상세)
-    tail = []
-    if s.get('median_price') is not None:
-        tail.append("중위가격 " + (fmt_money(s['median_price'], src) or ""))
-    disc = []
+    # 가격/할인 블록
+    tail=[]
+    if s.get('median_price') is not None: tail.append("중위가격 " + (fmt_money(s['median_price'], src) or ""))
+    disc=[]
     if s.get('discount_all')       is not None: disc.append(f"전체 {s['discount_all']:.2f}%")
     if s.get('discount_promo')     is not None: disc.append(f"프로모션 {s['discount_promo']:.2f}%")
     if s.get('discount_nonpromo')  is not None: disc.append(f"일반 {s['discount_nonpromo']:.2f}%")
@@ -556,7 +555,6 @@ def format_slack_block(src:str, s:dict)->str:
         L.append("*💵 가격/할인*")
         L.append(" / ".join(tail))
 
-    # 최종 인사이트
     if s.get('insights'):
         L.append("")
         L.append("*🧠 최종 인사이트*")
