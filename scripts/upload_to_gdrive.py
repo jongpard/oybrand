@@ -1,70 +1,82 @@
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+
 """
-필요 시에만 사용. (우선 Slack/HTML 안정화 후 on)
-환경변수:
-- GDRIVE_FOLDER_ID
-- GOOGLE_CLIENT_ID
-- GOOGLE_CLIENT_SECRET
-- GOOGLE_REFRESH_TOKEN
+dist/weekly_report.html 을 Google Drive 지정 폴더로 업로드.
+동일 이름 파일이 있으면 업데이트, 없으면 생성.
 """
+
 import os
+import sys
 import json
-import time
-import requests
-from pathlib import Path
+from datetime import datetime
+from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+from googleapiclient.http import MediaFileUpload
 
-TOKEN_URL = "https://oauth2.googleapis.com/token"
-UPLOAD_URL = "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart"
-SEARCH_URL = "https://www.googleapis.com/drive/v3/files"
+DIST_DIR = os.environ.get("DIST_DIR", "dist")
+HTML_FILE = os.path.join(DIST_DIR, "weekly_report.html")
 
-def _token():
-    data = {
-        "client_id": os.environ["GOOGLE_CLIENT_ID"],
-        "client_secret": os.environ["GOOGLE_CLIENT_SECRET"],
-        "refresh_token": os.environ["GOOGLE_REFRESH_TOKEN"],
-        "grant_type": "refresh_token",
-    }
-    r = requests.post(TOKEN_URL, data=data, timeout=30)
-    r.raise_for_status()
-    return r.json()["access_token"]
+FOLDER_ID      = os.environ.get("GDRIVE_FOLDER_ID", "")
+CLIENT_ID      = os.environ.get("GOOGLE_CLIENT_ID", "")
+CLIENT_SECRET  = os.environ.get("GOOGLE_CLIENT_SECRET", "")
+REFRESH_TOKEN  = os.environ.get("GOOGLE_REFRESH_TOKEN", "")
 
-def _escape_single_quotes(s: str) -> str:
-    # f-string 안에서 백슬래시 연산 금지 → 미리 계산
-    return s.replace("'", r"\'")
+def get_service():
+    if not (FOLDER_ID and CLIENT_ID and CLIENT_SECRET and REFRESH_TOKEN):
+        print("[GDRIVE] 환경변수 누락: GDRIVE_FOLDER_ID/GOOGLE_*", file=sys.stderr)
+        sys.exit(0)
 
-def _search_file(session, name, folder_id):
-    # 이름+폴더로 검색
-    q_name = _escape_single_quotes(name)
-    q = f"name = '{q_name}' and '{folder_id}' in parents and trashed = false"
-    r = session.get(SEARCH_URL, params={"q": q, "fields": "files(id,name)"}, timeout=30)
-    r.raise_for_status()
-    files = r.json().get("files", [])
+    creds = Credentials(
+        None,
+        refresh_token=REFRESH_TOKEN,
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=CLIENT_ID,
+        client_secret=CLIENT_SECRET,
+        scopes=["https://www.googleapis.com/auth/drive.file"],
+    )
+    return build("drive", "v3", credentials=creds, cache_discovery=False)
+
+def find_existing(service, folder_id, name):
+    # f-string 표현식에 backslash가 들어가지 않도록 안전 문자열을 미리 만든다.
+    safe = name.replace("'", "\\'")
+    q = f"name = '{safe}' and '{folder_id}' in parents and trashed = false"
+    resp = service.files().list(
+        q=q, spaces="drive",
+        fields="files(id, name)", pageSize=10
+    ).execute()
+    files = resp.get("files", [])
     return files[0]["id"] if files else None
 
-def upload(html_path: str, folder_id: str):
-    access = _token()
-    session = requests.Session()
-    session.headers.update({"Authorization": f"Bearer {access}"})
+def upload(service, folder_id, path, name):
+    file_id = find_existing(service, folder_id, name)
+    media = MediaFileUpload(path, mimetype="text/html", resumable=False)
 
-    name = Path(html_path).name
-    fid = _search_file(session, name, folder_id)
-
-    meta = {"name": name, "parents": [folder_id]}
-    files = {
-        "metadata": ("metadata", json.dumps(meta), "application/json; charset=UTF-8"),
-        "file": (name, open(html_path, "rb"), "text/html"),
-    }
-    if fid:
-        url = f"https://www.googleapis.com/upload/drive/v3/files/{fid}?uploadType=multipart"
-        r = session.patch(url, files=files, timeout=60)
+    if file_id:
+        print(f"[GDRIVE] update: {name}")
+        service.files().update(fileId=file_id, media_body=media).execute()
     else:
-        r = session.post(UPLOAD_URL, files=files, timeout=60)
-    r.raise_for_status()
-    print("GDRIVE: uploaded", name)
+        print(f"[GDRIVE] create: {name}")
+        metadata = {"name": name, "parents": [folder_id], "mimeType": "text/html"}
+        service.files().create(body=metadata, media_body=media, fields="id").execute()
+
+def main():
+    if not os.path.exists(HTML_FILE):
+        print(f"[GDRIVE] 업로드할 HTML이 없음: {HTML_FILE}", file=sys.stderr)
+        sys.exit(0)
+
+    # 파일명은 날짜 포함 (예: weekly_2025_08_18_2025_08_24.html)
+    # build_html_report.py 에서 같은 이름을 생성했다면 그대로 사용
+    name = os.path.basename(HTML_FILE)
+
+    try:
+        svc = get_service()
+        upload(svc, FOLDER_ID, HTML_FILE, name)
+        print("[GDRIVE] done")
+    except HttpError as e:
+        print(f"[GDRIVE] API error: {e}", file=sys.stderr)
+        sys.exit(1)
 
 if __name__ == "__main__":
-    dest = os.environ.get("GDRIVE_FOLDER_ID")
-    assert dest, "GDRIVE_FOLDER_ID is empty"
-    html = "dist/weekly_report.html"
-    assert Path(html).exists(), "dist/weekly_report.html not found"
-    upload(html, dest)
+    main()
