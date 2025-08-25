@@ -1,4 +1,4 @@
-name: Weekly Report → Slack & Email
+name: Weekly Report → Google Drive (single HTML)
 
 on:
   workflow_dispatch:
@@ -8,12 +8,6 @@ on:
 jobs:
   weekly:
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        src: [oy_kor, oy_global, amazon_us, qoo10_jp, daiso_kr]
-    env:
-      SRC: ${{ matrix.src }}
 
     steps:
       - uses: actions/checkout@v4
@@ -22,14 +16,14 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install tools & libs
+      - name: Install deps
         run: |
           sudo apt-get update
           sudo apt-get install -y jq
           python -m pip install --upgrade pip
           pip install pandas google-api-python-client google-auth-httplib2 google-auth-oauthlib
 
-      # 1) 구글 드라이브에서 일일 CSV 내려받기 (필수)
+      # 1) (선택) 구글 드라이브에서 일일 CSV 내려받기
       - name: Fetch daily CSVs from Google Drive
         env:
           GOOGLE_CLIENT_ID:     ${{ secrets.GOOGLE_CLIENT_ID }}
@@ -38,86 +32,39 @@ jobs:
           GDRIVE_FOLDER_ID:     ${{ secrets.GDRIVE_FOLDER_ID }}
         run: |
           mkdir -p data/daily
-          python scripts/fetch_from_gdrive.py
-          echo "== downloaded files in data/daily ==" 
+          # 레포에 이미 있는 스크립트 사용
+          python scripts/fetch_from_gdrive.py || true
+          echo "== data/daily =="
           ls -al data/daily || true
 
-      # 2) 주간 리포트 생성(소스별)
-      - name: Generate weekly report (per source)
+      # 2) 소스별 주간 리포트 생성(슬랙 텍스트, 요약 JSON)
+      - name: Generate weekly reports (all sources, sequential)
         env:
           DATA_DIR: ./data/daily
           MIN_DAYS: 3
-          FLASH_MAX_DAYS: 2
         run: |
-          python scripts/weekly_report_plus.py \
-            --src "${SRC}" \
-            --split \
-            --data-dir "$DATA_DIR" \
-            --min-days $MIN_DAYS
-
-      - name: Ensure report files exist
-        run: |
-          for f in "slack_${SRC}.txt" "weekly_summary_${SRC}.json"; do
-            if [ ! -f "$f" ]; then echo "데이터 없음" > "$f"; fi
+          for SRC in oy_kor oy_global amazon_us qoo10_jp daiso_kr; do
+            echo ">>> generate $SRC"
+            python scripts/weekly_report_plus.py \
+              --src "$SRC" \
+              --split \
+              --data-dir "$DATA_DIR" \
+              --min-days $MIN_DAYS || true
           done
 
-      # 3) 슬랙 전송
-      - name: Send to Slack (only if webhook exists)
-        env:
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-        shell: bash
+      # 3) HTML 합본 생성
+      - id: build_html
         run: |
-          if [ -n "$SLACK_WEBHOOK_URL" ]; then
-            BODY=$(jq -Rs . < "slack_${SRC}.txt")
-            curl -sS -X POST -H 'Content-type: application/json' \
-              --data "{\"text\": ${BODY} }" \
-              "$SLACK_WEBHOOK_URL"
-          else
-            echo "SLACK_WEBHOOK_URL 비어있음 → 스킵"
-          fi
+          HTML_FILE=$(python scripts/build_html_report.py)
+          echo "html=$HTML_FILE" >> "$GITHUB_OUTPUT"
+          echo "built: $HTML_FILE"
 
-      # 4) 메일 본문/제목 안전하게 읽기 (EOF 이슈 회피)
-      - id: read_body
-        uses: actions/github-script@v7
+      # 4) Google Drive 업서트
+      - name: Upload HTML to Google Drive
         env:
-          SRC: ${{ matrix.src }}
-        with:
-          script: |
-            const fs = require('fs');
-            const txt = fs.readFileSync(`slack_${process.env.SRC}.txt`, 'utf8');
-            core.setOutput('text', txt);
-
-      - id: meta
-        uses: actions/github-script@v7
-        env:
-          SRC: ${{ matrix.src }}
-        with:
-          script: |
-            const fs = require('fs');
-            const m = JSON.parse(fs.readFileSync(`weekly_summary_${process.env.SRC}.json`, 'utf8'));
-            const titleMap = {
-              oy_kor: '올리브영 국내 Top100',
-              oy_global: '올리브영 글로벌 Top100',
-              amazon_us: '아마존 US Top100',
-              qoo10_jp: '큐텐 재팬 뷰티 Top200',
-              daiso_kr: '다이소몰 뷰티/위생 Top200'
-            };
-            core.setOutput('title', titleMap[process.env.SRC] || process.env.SRC);
-            core.setOutput('range', m.range || '데이터 없음');
-
-      # 5) 메일 발송
-      - name: Send report via Email
-        uses: dawidd6/action-send-mail@v3
-        with:
-          server_address: ${{ secrets.SMTP_HOST }}
-          server_port: ${{ secrets.SMTP_PORT }}
-          username: ${{ secrets.SMTP_USERNAME }}
-          password: ${{ secrets.SMTP_PASSWORD }}
-          from: ${{ secrets.MAIL_FROM }}
-          to: ${{ secrets.MAIL_TO }}
-          subject: "[주간 리포트] ${{ steps.meta.outputs.title }} (${{ steps.meta.outputs.range }})"
-          content_type: text/plain; charset=UTF-8
-          body: ${{ steps.read_body.outputs.text }}
-          attachments: |
-            weekly_summary_${{ env.SRC }}.json
-            slack_${{ env.SRC }}.txt
+          GOOGLE_CLIENT_ID:     ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+          GDRIVE_FOLDER_ID:     ${{ secrets.GDRIVE_FOLDER_ID }}
+        run: |
+          python scripts/upload_to_gdrive.py "${{ steps.build_html.outputs.html }}"
