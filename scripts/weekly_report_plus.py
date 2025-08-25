@@ -356,7 +356,7 @@ def summarize_week(ud:pd.DataFrame, src:str, min_days:int=3):
         total_in += len(cur_set - prev_set)
         valid += 1
     in_avg = round(total_in/valid, 1) if valid else 0.0
-    inout_line = "비교 기준 없음" if valid==0 else f"IN {total_in}개 (일평균 {in_avg}개)"
+    inout_line = "비교 기준 없음" if valid==0 else f"일평균 {in_avg:.1f}개"
 
     # 히어로 / 반짝
     hist_keys=set(hist['key'].unique()) if not hist.empty else set()
@@ -458,9 +458,9 @@ def summarize_week(ud:pd.DataFrame, src:str, min_days:int=3):
         return "4만+"
     price_bucket_txt = price_bucket(src, med_price)
 
-    # 인사이트
-    keep_med = int(pts_stable['days'].median()) if not pts_stable.empty else 0
+    # 인사이트 (중복 제거: TopN 등극 SKU는 제외)
     keep_mean = round(float(pts_all['days'].mean()), 1) if not pts_all.empty else 0.0
+    keep_med  = int(pts_stable['days'].median()) if not pts_stable.empty else 0
     g_up=b.sort_values('delta',ascending=False).head(1)
     g_dn=b.sort_values('delta',ascending=True).head(1)
     up_txt = f"{g_up.iloc[0]['brand']}(+{round(g_up.iloc[0]['delta'],1)}/일)" if not g_up.empty and g_up.iloc[0]['delta']>0 else None
@@ -470,10 +470,7 @@ def summarize_week(ud:pd.DataFrame, src:str, min_days:int=3):
         diff=round(disc_promo-disc_non,2)
         if abs(diff)>=2.0: promo_effect=f"프로모션 평균 할인율이 일반 대비 {('+' if diff>0 else '')}{diff}%p"
 
-    insights=[
-        f"Top100 등극 SKU {total_in}개",
-        f"탑백 유지 평균 {keep_mean}일"
-    ]
+    insights=[f"Top {topn} 유지 평균 {keep_mean}일"]  # ← 요청대로 표기
     if up_txt or dn_txt:
         bits=[]
         if up_txt: bits.append("상승 "+up_txt)
@@ -486,9 +483,7 @@ def summarize_week(ud:pd.DataFrame, src:str, min_days:int=3):
         'range': f"{start.date()}~{end.date()}",
         'top10_lines': top_lines,
         'brand_lines': brand_lines,
-        'inout': inout_line,           # IN만, (일평균 n개)
-        'in_total': total_in,
-        'in_avg': in_avg,
+        'inout': inout_line,           # 🔁 인앤아웃(교체): "일평균 n.n개"
         'heroes': to_links(heroes),
         'flash': to_links(flash),
         'discount_all': disc_all,
@@ -516,10 +511,11 @@ def format_slack_block(src:str, s:dict)->str:
     L.append(f"📊 주간 리포트 · {title_map.get(src,src)} ({s['range']})")
     L.append("🏆 Top10"); L.extend(s.get('top10_lines') or ["데이터 없음"]); L.append("")
     L.append("🍞 브랜드 개수(일평균)"); L.extend(s.get('brand_lines') or ["데이터 없음"]); L.append("")
-    # IN만 표기
+    # 인앤아웃(교체): 일평균만
     L.append(f"🔁 인앤아웃(교체): {s.get('inout','비교 기준 없음')}")
-    L.append("🆕 신규 히어로: " + (", ".join(s.get('heroes') or []) if s.get('heroes') else "없음"))
-    L.append("✨ 반짝 아이템: " + (", ".join(s.get('flash')  or []) if s.get('flash')  else "없음"))
+    # 히어로/반짝 – 기준 설명 추가
+    L.append("🆕 신규 히어로(3일 이상 랭크 유지): " + (", ".join(s.get('heroes') or []) if s.get('heroes') else "없음"))
+    L.append("✨ 반짝 아이템(2일 이내 랭크 아웃): " + (", ".join(s.get('flash')  or []) if s.get('flash')  else "없음"))
     if s.get('cat_top5'): L.append("📈 카테고리 상위: " + " · ".join(s['cat_top5']))
     if s.get('kw_lines'):
         L.append("🔎 주간 키워드 분석"); L.extend(s['kw_lines'])
