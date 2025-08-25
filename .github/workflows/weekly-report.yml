@@ -1,91 +1,87 @@
-name: weekly-report
+name: Weekly Report
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
   schedule:
-    - cron: "0 21 * * MON"  # 월요일(UTC) 주간 실행, 필요 시 수정
+    # 매주 월요일 KST 오전 6시 (UTC 일 21:00)
+    - cron: '0 21 * * 0'
 
 jobs:
   weekly:
+    name: weekly (${{ matrix.src }})
     runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    strategy:
+      fail-fast: false
+      matrix:
+        src: [oy_kor, oy_global, amazon_us, qoo10_jp, daiso_kr]  # 쇼핑몰별 개별 실행
+
+    env:
+      # 슬랙/구글 드라이브 시크릿을 env로만 주입(조건 판단은 쉘에서 처리)
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+      GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+      GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+      GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+      SRC: ${{ matrix.src }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
 
       - name: Install deps
         run: |
-          python -m pip install -U pip
-          pip install pandas google-auth google-auth-oauthlib google-api-python-client tzdata
-          sudo apt-get update
-          sudo apt-get install -y jq
+          python -m pip install --upgrade pip
+          pip install pandas python-dateutil requests tzdata
+          pip install google-api-python-client google-auth google-auth-httplib2
 
-      - name: Prepare data dir
-        run: mkdir -p ./data/daily
-
-      - name: Debug (before fetch)
+      - name: Ensure data dir
         run: |
-          echo "== before fetch =="
-          find . -maxdepth 2 -type d -print | sed 's/^/DIR  /'
-          find . -maxdepth 2 -type f -name "*.csv" -print | sed 's/^/FILE /'
-
-      # 필요하면 사용 (구글 드라이브에서 CSV 내려받기)
-      - name: Fetch daily CSVs from Google Drive (optional)
-        run: python scripts/fetch_from_gdrive.py
-        continue-on-error: true
-        env:
-          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
-          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
-          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
-          GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
-
-      - name: Debug (after fetch)
-        run: |
-          echo "== after fetch =="
-          find ./data -maxdepth 2 -type f -name "*.csv" -print | sed 's/^/FILE /'
-          ls -al ./data/daily || true
+          mkdir -p data/daily
+          # (필요 시) 여기서 일일 CSV를 동기화하는 스크립트를 호출하세요.
+          # python scripts/fetch_from_gdrive.py --out data/daily  # 예시
 
       - name: Generate weekly report (per source)
-        run: python scripts/weekly_report_plus.py --src all --data-dir ./data/daily
-
-      - name: Ensure report files exist
         run: |
-          test -f weekly_summary_oy_kor.json || echo '{"range":"데이터 없음"}' > weekly_summary_oy_kor.json
-          test -f weekly_summary_oy_global.json || echo '{"range":"데이터 없음"}' > weekly_summary_oy_global.json
-          test -f weekly_summary_amazon_us.json || echo '{"range":"데이터 없음"}' > weekly_summary_amazon_us.json
-          test -f weekly_summary_qoo10_jp.json || echo '{"range":"데이터 없음"}' > weekly_summary_qoo10_jp.json
-          test -f weekly_summary_daiso_kr.json || echo '{"range":"데이터 없음"}' > weekly_summary_daiso_kr.json
+          python scripts/weekly_report_plus.py --src "${SRC}" --data-dir ./data/daily
 
-      - name: Post to Slack (per source)
-        env:
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      - name: Send to Slack (optional)
+        # secrets를 if:에서 직접 평가하지 않고, 쉘에서 존재 여부 체크
         run: |
-          post() {
-            BODY=$(jq -Rs . < "$1")
-            curl -sS -X POST -H 'Content-type: application/json' \
-                 --data "{\"text\": ${BODY}}" "$SLACK_WEBHOOK_URL" > /dev/null
-          }
-          if [ -n "${SLACK_WEBHOOK_URL:-}" ]; then
-            for f in slack_*.txt; do
-              [ -f "$f" ] && post "$f"
-            done
+          [ -n "${SLACK_WEBHOOK_URL}" ] || { echo "SLACK_WEBHOOK_URL empty → skip"; exit 0; }
+          MSG="slack_${SRC}.txt"
+          if [ -f "${MSG}" ]; then
+            BODY=$(jq -Rs . < "${MSG}")
+            curl -sS -X POST \
+              -H 'Content-type: application/json' \
+              --data "{\"text\": ${BODY}}" \
+              "${SLACK_WEBHOOK_URL}" >/dev/null
+            echo "Slack posted: ${MSG}"
           else
-            echo "SLACK_WEBHOOK_URL not set; skipping Slack posts."
+            echo "No Slack message file: ${MSG} (skip)"
           fi
 
       - name: Build HTML
         id: build_html
         run: |
-          HTML_FILE=$(python scripts/build_html_report.py)
-          echo "html=${HTML_FILE}" >> "$GITHUB_OUTPUT"
+          # 산출물을 dist/ 에 생성
+          mkdir -p dist
+          python scripts/build_html_report.py --src "${SRC}" --out dist
+          HTML_FILE=$(ls dist/*.html | head -n1)
+          echo "html_file=${HTML_FILE}" >> "$GITHUB_OUTPUT"
+          echo "HTML_FILE=${HTML_FILE}"
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: weekly-report
-          path: ${{ steps.build_html.outputs.html }}
+      - name: Upload HTML to Google Drive (optional)
+        run: |
+          [ -n "${GDRIVE_FOLDER_ID}" ] || { echo "GDRIVE_FOLDER_ID empty → skip"; exit 0; }
+          [ -n "${GOOGLE_CLIENT_ID}" ] && [ -n "${GOOGLE_CLIENT_SECRET}" ] && [ -n "${GOOGLE_REFRESH_TOKEN}" ] || { echo "Google OAuth secrets empty → skip"; exit 0; }
+          python scripts/gdrive_upload.py \
+            --file "${{ steps.build_html.outputs.html_file }}" \
+            --folder "${GDRIVE_FOLDER_ID}" \
+            --name "$(basename "${{ steps.build_html.outputs.html_file }}")"
