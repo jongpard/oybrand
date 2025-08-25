@@ -44,15 +44,19 @@ jobs:
           done
 
       # ---------- Slack ----------
-      - name: Send to Slack
-        if: ${{ secrets.SLACK_WEBHOOK_URL != '' }}
+      - name: Send to Slack (only if webhook exists)
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        shell: bash
         run: |
-          BODY=$(jq -Rs . < "slack_${{ matrix.src }}.txt")
-          curl -sS -X POST -H 'Content-type: application/json' \
-            --data "{\"text\": ${BODY} }" \
-            "$SLACK_WEBHOOK_URL"
+          if [ -n "$SLACK_WEBHOOK_URL" ]; then
+            BODY=$(jq -Rs . < "slack_${{ matrix.src }}.txt")
+            curl -sS -X POST -H 'Content-type: application/json' \
+              --data "{\"text\": ${BODY} }" \
+              "$SLACK_WEBHOOK_URL"
+          else
+            echo "SLACK_WEBHOOK_URL 비어있음 → 스킵"
+          fi
 
       # ---------- Email ----------
       - id: meta
