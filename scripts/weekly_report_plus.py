@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """
 Weekly ranking report generator (Slack + JSON)
-요구사항 반영 사항:
+
+요구사항 반영:
 - 집계 구간: '최근 완결 월~일' + 직전 '월~일' 비교 고정
 - Top10 정렬: (-유지일, 평균순위, 최저순위) => 반짝 1위 방지
 - 등락: (괄호) NEW/유지/↑n/↓n
@@ -186,7 +187,10 @@ def unify_cols(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 def load_files_for_range(src: str, data_dir: str, start: date, end: date) -> List[str]:
+    """폴더가 없어도 안전하게 빈 리스트 반환(== 데이터 없음 처리)"""
     outs = []
+    if not os.path.isdir(data_dir):
+        return []
     for fn in os.listdir(data_dir):
         full = os.path.join(data_dir, fn)
         if not os.path.isfile(full):
@@ -224,7 +228,7 @@ def load_week_df(src: str, data_dir: str, start: date, end: date, topn: int) -> 
     for p in files:
         d = parse_date_from_filename(os.path.basename(p))
         df = unify_cols(read_csv_any(p))
-        if "rank" not in df.columns: 
+        if "rank" not in df.columns:
             continue
         df = df[df["rank"].notnull()].sort_values("rank").head(topn).copy()
         df["date"] = pd.to_datetime(d)
@@ -248,7 +252,7 @@ class ItemStat:
 
 def build_stats(src: str, df: pd.DataFrame, topn: int) -> Dict[str, ItemStat]:
     stats: Dict[str, ItemStat] = {}
-    if df.empty: 
+    if df.empty:
         return stats
 
     df["sku"] = df.apply(lambda r: extract_sku(r, src), axis=1)
@@ -501,6 +505,9 @@ def main():
     ap.add_argument("--src", choices=list(SRC_SPECS.keys()) + ["all"], required=True)
     ap.add_argument("--data-dir", default="./data/daily")
     args = ap.parse_args()
+
+    # ⬇️ 폴더가 없어도 에러나지 않도록 보장
+    os.makedirs(args.data_dir, exist_ok=True)
 
     if args.src == "all":
         results = {}
