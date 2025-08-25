@@ -43,19 +43,20 @@ jobs:
             if [ ! -f "$f" ]; then echo "데이터 없음" > "$f"; fi
           done
 
-      # ---------------- Slack ----------------
+      # ---------- Slack ----------
       - name: Send to Slack
-        if: ${{ env.SLACK_WEBHOOK_URL != '' }}
+        if: ${{ secrets.SLACK_WEBHOOK_URL != '' }}
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: |
-          BODY=$(jq -Rs . < "slack_${{ matrix.src }}.txt")   # 파일을 JSON 문자열로 인코딩
+          BODY=$(jq -Rs . < "slack_${{ matrix.src }}.txt")
           curl -sS -X POST -H 'Content-type: application/json' \
             --data "{\"text\": ${BODY} }" \
             "$SLACK_WEBHOOK_URL"
 
-      # -------------- Email ------------------
+      # ---------- Email ----------
       - id: meta
+        shell: bash
         run: |
           RANGE=$(jq -r '.range // "데이터 없음"' "weekly_summary_${{ matrix.src }}.json")
           case "${{ matrix.src }}" in
@@ -65,14 +66,19 @@ jobs:
             qoo10_jp)  TITLE="큐텐 재팬 뷰티 Top200" ;;
             daiso_kr)  TITLE="다이소몰 뷰티/위생 Top200" ;;
           esac
-          echo "range=$RANGE" >> $GITHUB_OUTPUT
-          echo "title=$TITLE" >> $GITHUB_OUTPUT
+          {
+            echo "range=$RANGE"
+            echo "title=$TITLE"
+          } >> "$GITHUB_OUTPUT"
 
       - id: body
+        shell: bash
         run: |
-          echo "text<<'EOF'" >> $GITHUB_OUTPUT
-          cat "slack_${{ matrix.src }}.txt" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
+          {
+            echo 'text<<EOF'
+            cat "slack_${{ matrix.src }}.txt"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
 
       - name: Send report via Email
         uses: dawidd6/action-send-mail@v3
