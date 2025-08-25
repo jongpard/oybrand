@@ -65,13 +65,15 @@ RE_INFL_PICK = re.compile(r"([가-힣A-Za-z0-9.&/_-]+)\s*(픽|Pick)\b", re.I)
 EXCLUDE_INFL = {"올영", "올리브영", "월올영", "원픽"}
 
 PAT_MARKETING = {
-    "올영픽":     r"(올영픽|올리브영\s*픽)",
-    "특가":       r"(특가|핫딜|세일|할인)",
-    "세트":       r"(세트|패키지|트리오|듀오|세트킷|키트|킷\b)",
-    "기획":       r"(기획|기획전)",
-    "1+1/증정":   r"(1\+1|1\+2|덤|증정|사은품)",
-    "한정/NEW":   r"(한정|리미티드|NEW|뉴\b)",
-    "쿠폰/딜":    r"(쿠폰|딜\b|딜가|프로모션|프로모\b)",
+    "올영픽": r"(올영픽|올리브영\s*픽)",
+    "PICK":   r"\bPICK\b",                           # 콜라보 PICK 존재 자체를 마케팅 키워드로 집계
+    "특가":   r"(특가|핫딜|세일|할인)",
+    "세트":   r"(세트|패키지|트리오|듀오|세트킷|키트|킷\b)",
+    "기획":   r"(기획|기획전)",
+    "1+1":    r"(?:^|\s)1\+1(?:\s|$)",               # ← 1+1만 별도 집계
+    "증정":   r"(증정|사은품)",                      # ← 증정/사은품 별도 집계
+    "한정":   r"(한정|리미티드)",
+    "NEW":    r"\bNEW\b|(?<!리)뉴\b",
 }
 PAT_MARKETING = {k: re.compile(v, re.I) for k, v in PAT_MARKETING.items()}
 
@@ -411,24 +413,28 @@ def kw_summary(src: str, df: pd.DataFrame) -> Dict[str, any]:
 
 # --------------------------- 포맷(슬랙/JSON) ---------------------------
 def format_kw_for_slack(kw: Dict[str, any]) -> str:
-    if kw.get("unique",0) == 0:
+    if kw.get("unique", 0) == 0:
         return "데이터 없음"
+
+    def pct(cnt: int) -> float:
+        return round(cnt * 100.0 / max(1, kw["unique"]), 1)
+
     lines = []
     lines.append("📊 *주간 키워드 분석*")
     lines.append(f"- 유니크 SKU: {kw['unique']}개")
+
     if kw["marketing"]:
-        lines.append("• *마케팅 키워드*")
-        for k, cnt in kw["marketing"].items():
-            ratio = round(cnt * 100.0 / max(1, kw["unique"]), 1)
-            lines.append(f"  - {k}: {cnt}개 ({ratio}%)")
+        mk_parts = [f"{k} {v}개({pct(v)}%)" for k, v in kw["marketing"].items()]
+        lines.append("• *마케팅 키워드* " + " · ".join(mk_parts))  # ← 가로 나열
+
     if kw["influencers"]:
-        lines.append("• *인플루언서*")
-        for k, cnt in kw["influencers"].items():
-            lines.append(f"  - {k}: {cnt}개")
+        infl_parts = [f"{k} {v}개" for k, v in kw["influencers"].items()]
+        lines.append("• *인플루언서* " + " · ".join(infl_parts))   # ← 가로 나열
+
     if kw["ingredients"]:
-        lines.append("• *성분 키워드*")
-        for k, cnt in kw["ingredients"].items():
-            lines.append(f"  - {k}: {cnt}개")
+        ing_parts = [f"{k} {v}개" for k, v in kw["ingredients"].items()]
+        lines.append("• *성분 키워드* " + " · ".join(ing_parts))   # ← 가로 나열
+
     return "\n".join(lines)
 
 def format_brand_lines(avg_counts: Dict[str, float], limit: int = 15) -> List[str]:
