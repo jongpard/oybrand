@@ -3,28 +3,17 @@ name: Weekly Report
 on:
   workflow_dispatch:
   schedule:
-    # 매주 월요일 KST 오전 6시 (UTC 일 21:00)
+    # 매주 월요일 06:00 KST (일 21:00 UTC)
     - cron: '0 21 * * 0'
+
+env:
+  PYTHON_VERSION: '3.11'
+  DATA_DIR: data/daily
+  DIST_DIR: dist
 
 jobs:
   weekly:
-    name: weekly (${{ matrix.src }})
     runs-on: ubuntu-latest
-    timeout-minutes: 25
-
-    strategy:
-      fail-fast: false
-      matrix:
-        src: [oy_kor, oy_global, amazon_us, qoo10_jp, daiso_kr]  # 쇼핑몰별 개별 실행
-
-    env:
-      # 슬랙/구글 드라이브 시크릿을 env로만 주입(조건 판단은 쉘에서 처리)
-      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-      GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
-      GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
-      GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
-      GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
-      SRC: ${{ matrix.src }}
 
     steps:
       - name: Checkout
@@ -33,55 +22,92 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install pandas python-dateutil requests tzdata
-          pip install google-api-python-client google-auth google-auth-httplib2
+          pip install -r requirements.txt
 
-      - name: Ensure data dir
+      - name: Ensure data/output dirs
         run: |
-          mkdir -p data/daily
-          # (필요 시) 여기서 일일 CSV를 동기화하는 스크립트를 호출하세요.
-          # python scripts/fetch_from_gdrive.py --out data/daily  # 예시
+          mkdir -p "${DATA_DIR}" "${DIST_DIR}"
 
+      # ▶ Google Drive 에서 최근 CSV 내려받기 (선택)
+      - name: Fetch daily CSVs from Google Drive (optional)
+        if: ${{ secrets.GDRIVE_FOLDER_ID != '' }}
+        env:
+          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+        run: |
+          python scripts/fetch_from_gdrive.py \
+            --folder "${GDRIVE_FOLDER_ID}" \
+            --out "${DATA_DIR}" \
+            --days 21
+
+      # (선택) 빠른 스캔 – 파일 유입 확인
+      - name: Quick scan (optional)
+        run: |
+          python scripts/check_daily_scan.py || true
+
+      # ▶ 주간 요약 생성 (섹션별 Slack 텍스트 / 요약 JSON 생성)
       - name: Generate weekly report (per source)
         run: |
-          python scripts/weekly_report_plus.py --src "${SRC}" --data-dir ./data/daily
+          python scripts/weekly_report_plus.py --src all --data-dir "./${DATA_DIR}"
 
+      # ▶ Slack 전송 (선택, 섹션별 순차)
       - name: Send to Slack (optional)
-        # secrets를 if:에서 직접 평가하지 않고, 쉘에서 존재 여부 체크
+        if: ${{ secrets.SLACK_WEBHOOK_URL != '' }}
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: |
-          [ -n "${SLACK_WEBHOOK_URL}" ] || { echo "SLACK_WEBHOOK_URL empty → skip"; exit 0; }
-          MSG="slack_${SRC}.txt"
-          if [ -f "${MSG}" ]; then
-            BODY=$(jq -Rs . < "${MSG}")
-            curl -sS -X POST \
-              -H 'Content-type: application/json' \
-              --data "{\"text\": ${BODY}}" \
-              "${SLACK_WEBHOOK_URL}" >/dev/null
-            echo "Slack posted: ${MSG}"
-          else
-            echo "No Slack message file: ${MSG} (skip)"
-          fi
+          post() {
+            local f="$1"
+            [ -f "$f" ] || return 0
+            BODY=$(jq -Rs . < "$f")
+            curl -sS -X POST -H 'Content-type: application/json' \
+              --data "{\"text\":${BODY}}" "$SLACK_WEBHOOK_URL" >/dev/null
+          }
+          # weekly_report_plus.py 가 동일 경로에 생성하는 텍스트 파일들 전송
+          post slack_oy_kor.txt
+          post slack_oy_global.txt
+          post slack_amazon_us.txt
+          post slack_qoo10_jp.txt
+          post slack_daiso_kr.txt
 
+      # ▶ HTML 리포트 생성
       - name: Build HTML
         id: build_html
+        shell: bash
         run: |
-          # 산출물을 dist/ 에 생성
-          mkdir -p dist
-          python scripts/build_html_report.py --src "${SRC}" --out dist
-          HTML_FILE=$(ls dist/*.html | head -n1)
-          echo "html_file=${HTML_FILE}" >> "$GITHUB_OUTPUT"
-          echo "HTML_FILE=${HTML_FILE}"
+          set -e
+          HTML_FILE=$(python scripts/build_html_report.py)
+          # 스크립트가 경로를 stdout 으로 반환한다고 가정
+          # 고정 경로가 필요하면 아래처럼 복사
+          TARGET="${DIST_DIR}/weekly_report.html"
+          if [ -f "$HTML_FILE" ]; then
+            cp "$HTML_FILE" "$TARGET"
+          else
+            # 이미 dist 로 생성됐다면 그 경로를 사용
+            TARGET="${HTML_FILE}"
+          fi
+          echo "html_file=$TARGET" >> "$GITHUB_OUTPUT"
+          echo "HTML_FILE => $TARGET"
 
+      # ▶ Google Drive 업로드 (선택)
       - name: Upload HTML to Google Drive (optional)
+        if: ${{ secrets.GDRIVE_FOLDER_ID != '' }}
+        env:
+          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
         run: |
-          [ -n "${GDRIVE_FOLDER_ID}" ] || { echo "GDRIVE_FOLDER_ID empty → skip"; exit 0; }
-          [ -n "${GOOGLE_CLIENT_ID}" ] && [ -n "${GOOGLE_CLIENT_SECRET}" ] && [ -n "${GOOGLE_REFRESH_TOKEN}" ] || { echo "Google OAuth secrets empty → skip"; exit 0; }
-          python scripts/gdrive_upload.py \
+          python scripts/upload_to_gdrive.py \
             --file "${{ steps.build_html.outputs.html_file }}" \
             --folder "${GDRIVE_FOLDER_ID}" \
-            --name "$(basename "${{ steps.build_html.outputs.html_file }}")"
+            --name "$(date +'%Y_%m_%d')_weekly.html"
+
+      # 다운로드용 아티팩트 업로드
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: weekly-html
+          path: ${{ steps.build_html.outputs.html_file }}
+          if-no-files-found: warn
