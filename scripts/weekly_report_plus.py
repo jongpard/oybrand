@@ -1,38 +1,43 @@
 # -*- coding: utf-8 -*-
 """
 Weekly ranking report generator (Slack + JSON)
-- 월~일 가장 최근 완결 7일 집계, 직전 주와 비교
-- 소스: oy_kor, oy_global, amazon_us, qoo10_jp, daiso_kr
-- 산출물:
+요구사항 반영 사항:
+- 집계 구간: '최근 완결 월~일' + 직전 '월~일' 비교 고정
+- Top10 정렬: (-유지일, 평균순위, 최저순위) => 반짝 1위 방지
+- 등락: (괄호) NEW/유지/↑n/↓n
+- 인앤아웃: IN=OUT => '일평균 X.Y개' 한 줄
+- 인플루언서: 오직 oy_kor(올리브영 국내)만 집계, '올영픽'과 'PICK' 완전 분리
+- 성분: configs/ingredients.txt 동적 로드(없으면 기본 목록)
+- 링크: Slack <url|텍스트>, HTML용 anchor 정보 함께 JSON에 저장
+- 통계: 'Top100 등극 SKU', 'Top100 유지 평균(일)' 포함
+출력:
   - slack_{src}.txt
   - weekly_summary_{src}.json
 사용:
-  python scripts/weekly_report_plus.py --src oy_kor --split --data-dir ./data/daily --min-days 3
+  python scripts/weekly_report_plus.py --src all --data-dir ./data/daily
 """
 
 import argparse
 import json
 import os
 import re
-import sys
-from collections import defaultdict, Counter
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 
-# ------------------------------- 기본 설정 -------------------------------
 
+# ----------------------------- 소스 스펙 -----------------------------
 SRC_SPECS = {
-    "oy_kor":    {"title": "올리브영 국내 Top100",    "topn": 100},
-    "oy_global": {"title": "올리브영 글로벌 Top100",  "topn": 100},
-    "amazon_us": {"title": "아마존 US Top100",        "topn": 100},
-    "qoo10_jp":  {"title": "큐텐 재팬 뷰티 Top200",   "topn": 200},
-    "daiso_kr":  {"title": "다이소몰 뷰티/위생 Top200","topn": 200},
+    "oy_kor":    {"title": "올리브영 국내 Top100",     "topn": 100},
+    "oy_global": {"title": "올리브영 글로벌 Top100",   "topn": 100},
+    "amazon_us": {"title": "아마존 US Top100",         "topn": 100},
+    "qoo10_jp":  {"title": "큐텐 재팬 뷰티 Top200",    "topn": 200},
+    "daiso_kr":  {"title": "다이소몰 뷰티/위생 Top200", "topn": 200},
 }
 
-# 파일명으로 소스 식별 (느슨한 한글 포함)
 FILENAME_HINTS = {
     "oy_kor":    ["올리브영_랭킹", "올리브영 국내", "oy_kor"],
     "oy_global": ["올리브영글로벌", "oy_global"],
@@ -41,30 +46,29 @@ FILENAME_HINTS = {
     "daiso_kr":  ["다이소몰", "daiso_kr"],
 }
 
-SKU_KEY_CANDIDATES = [
-    "goodsNo", "productId", "asin", "product_code", "pdNo",
-    "item_id", "id", "sku", "url_key"
-]
+RANK_COLS  = ["rank", "순위", "랭킹", "ranking", "Rank"]
+BRAND_COLS = ["brand", "브랜드", "Brand"]
+NAME_COLS  = ["raw_name", "제품명", "상품명", "name", "title"]
+URL_COLS   = ["url", "URL", "link", "주소", "링크"]
 
-RANK_COL_CAND = ["rank", "순위", "랭킹", "ranking", "Rank"]
-BRAND_COL_CAND = ["brand", "브랜드", "Brand"]
-NAME_COL_CAND = ["raw_name", "제품명", "상품명", "name", "title"]
-URL_COL_CAND  = ["url", "URL", "link", "주소", "링크"]
+SKU_KEYS = ["goodsNo", "productId", "asin", "product_code", "pdNo", "sku", "id", "item_id", "url_key"]
 
-# -------------------------- 올영픽/PICK/성분 파서 -------------------------
 
-RE_OY_PICK  = re.compile(r"(올영픽|올리브영\s*픽)\b", re.I)
-RE_INFL_PK  = re.compile(r"([가-힣A-Za-z0-9.&/_-]+)\s*(픽|Pick)\b", re.I)
-EXCLUDE_INFL = {"올영", "올리브영", "월올영", "원픽"}
+# ----------------------- 올영픽 / PICK / 성분 -----------------------
+# '올영픽'(프로모션)과 'PICK'(인플루언서)은 별개!
+RE_OY_PICK = re.compile(r"(올영픽|올리브영\s*픽)\b", re.I)
+RE_INFL_PICK = re.compile(r"([가-힣A-Za-z0-9.&/_-]+)\s*(픽|Pick)\b", re.I)
+EXCLUDE_INFL = {"올영", "올리브영", "월올영", "원픽"}  # 인플 후보 제거
 
+# 마케팅 키워드(모두 노출, 병합 금지)
 PAT_MARKETING = {
-    "올영픽"   : r"(올영픽|올리브영\s*픽)",
-    "특가"     : r"(특가|핫딜|세일|할인)",
-    "세트"     : r"(세트|구성|트리오|듀오|패키지|킷\b|키트\b)",
-    "기획"     : r"(기획|기획전)",
-    "1+1/증정" : r"(1\+1|1\+2|덤|증정|사은품)",
-    "한정/NEW" : r"(한정|리미티드|NEW|뉴\b)",
-    "쿠폰/딜"  : r"(쿠폰|딜\b|딜가|프로모션|프로모\b)",
+    "올영픽":     r"(올영픽|올리브영\s*픽)",
+    "특가":       r"(특가|핫딜|세일|할인)",
+    "세트":       r"(세트|패키지|트리오|듀오|세트킷|키트|킷\b)",
+    "기획":       r"(기획|기획전)",
+    "1+1/증정":   r"(1\+1|1\+2|덤|증정|사은품)",
+    "한정/NEW":   r"(한정|리미티드|NEW|뉴\b)",
+    "쿠폰/딜":    r"(쿠폰|딜\b|딜가|프로모션|프로모\b)",
 }
 PAT_MARKETING = {k: re.compile(v, re.I) for k, v in PAT_MARKETING.items()}
 
@@ -73,33 +77,33 @@ DEFAULT_INGRS = [
     "비타민C","BHA","AHA","PHA","판테놀","센텔라","마데카소사이드",
 ]
 
-def load_ingredients_from_file() -> List[str]:
+def load_ingredients() -> List[str]:
     path = os.path.join("configs", "ingredients.txt")
     if not os.path.exists(path):
         return DEFAULT_INGRS[:]
-    words = []
+    out = []
     with open(path, "r", encoding="utf-8") as f:
         for ln in f:
             ln = ln.strip()
             if not ln or ln.startswith("#"):
                 continue
-            words.append(ln)
-    return words or DEFAULT_INGRS[:]
+            out.append(ln)
+    return out or DEFAULT_INGRS[:]
 
-INGR_WORDS = load_ingredients_from_file()
+INGR_WORDS = load_ingredients()
 
-def parse_marketing_and_infl(raw_name: str):
+def parse_marketing_and_infl(raw_name: str) -> Tuple[Dict[str, bool], Optional[str]]:
     name = raw_name or ""
     mk = {k: bool(p.search(name)) for k, p in PAT_MARKETING.items()}
     infl = None
-    m = RE_INFL_PK.search(name)
+    m = RE_INFL_PICK.search(name)
     if m:
         cand = re.sub(r"[\[\](),.|·]", "", m.group(1)).strip()
         if cand and cand not in EXCLUDE_INFL and not RE_OY_PICK.search(name):
             infl = cand
     return mk, infl
 
-def extract_ingredients(raw_name: str, ingr_list=None):
+def extract_ingredients(raw_name: str, ingr_list=None) -> List[str]:
     name = raw_name or ""
     ingr_list = ingr_list or INGR_WORDS
     out = []
@@ -108,53 +112,29 @@ def extract_ingredients(raw_name: str, ingr_list=None):
             out.append(w)
     return out
 
-# ------------------------------- 유틸 -------------------------------
 
-def find_existing_col(cols: List[str], cands: List[str]) -> Optional[str]:
-    for c in cands:
+# ------------------------------ 유틸 ------------------------------
+def first_existing(cols, candidates) -> Optional[str]:
+    for c in candidates:
         if c in cols:
             return c
-    # 대소문자/공백/한영 혼용 보정
-    lowered = {c.lower(): c for c in cols}
-    for c in cands:
-        key = c.lower()
-        if key in lowered:
-            return lowered[key]
+    lower = {c.lower(): c for c in cols}
+    for c in candidates:
+        if c.lower() in lower:
+            return lower[c.lower()]
     return None
 
-def parse_query_param(url: str, key: str) -> Optional[str]:
+def parse_query(url: str, key: str) -> Optional[str]:
     if not url:
         return None
-    try:
-        # 빠른 정규식 파서
-        m = re.search(r"[?&]" + re.escape(key) + r"=([^&#]+)", url)
-        if m:
-            return m.group(1)
-    except Exception:
-        pass
-    return None
+    m = re.search(r"[?&]" + re.escape(key) + r"=([^&#]+)", url)
+    return m.group(1) if m else None
 
-def extract_sku(row: Dict, src: str, url_col: Optional[str]) -> str:
-    # 1) 명시 필드 우선
-    for k in SKU_KEY_CANDIDATES:
-        if k in row and pd.notna(row[k]) and str(row[k]).strip():
-            return str(row[k]).strip()
-    url = str(row.get(url_col, "") or "")
-    if src in ("oy_kor",):
-        return parse_query_param(url, "goodsNo") or url
-    if src in ("oy_global",):
-        return parse_query_param(url, "productId") or url
-    if src in ("amazon_us",):
-        # 아마존은 asin 필드 있거나 URL path에서 추출
-        asin = row.get("asin")
-        if asin: return str(asin)
-        m = re.search(r"/([A-Z0-9]{10})(?:[/?]|$)", url)
-        return m.group(1) if m else url
-    if src in ("qoo10_jp",):
-        return parse_query_param(url, "product_code") or url
-    if src in ("daiso_kr",):
-        return parse_query_param(url, "pdNo") or url
-    return url
+def guess_src_from_filename(fn: str) -> Optional[str]:
+    for src, hints in FILENAME_HINTS.items():
+        if any(h in fn for h in hints):
+            return src
+    return None
 
 def parse_date_from_filename(fn: str) -> Optional[date]:
     m = re.search(r"(\d{4}-\d{2}-\d{2})", fn)
@@ -166,42 +146,46 @@ def parse_date_from_filename(fn: str) -> Optional[date]:
         return None
 
 def last_complete_week(today: Optional[date] = None) -> Tuple[date, date]:
-    """
-    최근 완결 주(월~일). 오늘이 월~일 중 어디든 상관없이,
-    직전 '일요일'까지의 한 주를 반환.
-    """
+    """지난 '일요일' 기준 완결 주(월~일)"""
     today = today or date.today()
-    # 월=0 ... 일=6
-    weekday = today.weekday()
-    # 지난 일요일
-    last_sunday = today - timedelta(days=(weekday + 1))
-    start = last_sunday - timedelta(days=6)  # 월요일
-    end = last_sunday
-    return start, end
+    weekday = today.weekday()  # 월=0 ... 일=6
+    last_sun = today - timedelta(days=weekday + 1)
+    start = last_sun - timedelta(days=6)
+    return start, last_sun
 
 def prev_week_range(start: date, end: date) -> Tuple[date, date]:
-    delta = timedelta(days=7)
-    return (start - delta, end - delta)
+    return (start - timedelta(days=7), end - timedelta(days=7))
 
 def within(d: date, start: date, end: date) -> bool:
     return start <= d <= end
 
-def ensure_int(x) -> Optional[int]:
-    try:
-        v = int(float(x))
-        return v
-    except Exception:
-        return None
 
-# ---------------------- 데이터 적재 & 전처리 ----------------------
+# ------------------------- 데이터 적재/정제 -------------------------
+def read_csv_any(path: str) -> pd.DataFrame:
+    for enc in ("utf-8", "cp949", "latin1"):
+        try:
+            return pd.read_csv(path, encoding=enc)
+        except Exception:
+            continue
+    return pd.read_csv(path)  # 마지막 시도
 
-def guess_src_from_filename(fn: str) -> Optional[str]:
-    for src, hints in FILENAME_HINTS.items():
-        if any(h in fn for h in hints):
-            return src
-    return None
+def unify_cols(df: pd.DataFrame) -> pd.DataFrame:
+    cols = list(df.columns)
+    out = pd.DataFrame()
 
-def load_daily_files_for_range(src: str, data_dir: str, start: date, end: date) -> List[str]:
+    r = first_existing(cols, RANK_COLS)
+    b = first_existing(cols, BRAND_COLS)
+    n = first_existing(cols, NAME_COLS)
+    u = first_existing(cols, URL_COLS)
+
+    if r: out["rank"] = pd.to_numeric(df[r], errors="coerce")
+    if b: out["brand"] = df[b].fillna("").astype(str)
+    if n: out["raw_name"] = df[n].fillna("").astype(str)
+    if u: out["url"] = df[u].fillna("").astype(str)
+
+    return out
+
+def load_files_for_range(src: str, data_dir: str, start: date, end: date) -> List[str]:
     outs = []
     for fn in os.listdir(data_dir):
         full = os.path.join(data_dir, fn)
@@ -210,143 +194,136 @@ def load_daily_files_for_range(src: str, data_dir: str, start: date, end: date) 
         d = parse_date_from_filename(fn)
         if not d or not within(d, start, end):
             continue
-        guessed = guess_src_from_filename(fn)
-        if guessed == src:
+        if guess_src_from_filename(fn) == src:
             outs.append(full)
     return sorted(outs)
 
-def read_csv_any(path: str) -> pd.DataFrame:
-    try:
-        return pd.read_csv(path, encoding="utf-8")
-    except Exception:
-        try:
-            return pd.read_csv(path, encoding="cp949")
-        except Exception:
-            return pd.read_csv(path, encoding="latin1")
+def extract_sku(row: Dict, src: str) -> str:
+    # 1) 명시 필드
+    for k in SKU_KEYS:
+        if k in row and str(row[k]).strip():
+            return str(row[k]).strip()
+    url = str(row.get("url", "") or "")
+    if src == "oy_kor":
+        return parse_query(url, "goodsNo") or url
+    if src == "oy_global":
+        return parse_query(url, "productId") or url
+    if src == "amazon_us":
+        if row.get("asin"): return str(row["asin"])
+        m = re.search(r"/([A-Z0-9]{10})(?:[/?]|$)", url)
+        return m.group(1) if m else url
+    if src == "qoo10_jp":
+        return parse_query(url, "product_code") or url
+    if src == "daiso_kr":
+        return parse_query(url, "pdNo") or url
+    return url
 
-def unify_columns(df: pd.DataFrame) -> pd.DataFrame:
-    # 기본 컬럼 존재 보정
-    cols = list(df.columns)
-    rank_col  = find_existing_col(cols, RANK_COL_CAND)
-    brand_col = find_existing_col(cols, BRAND_COL_CAND)
-    name_col  = find_existing_col(cols, NAME_COL_CAND)
-    url_col   = find_existing_col(cols, URL_COL_CAND)
-
-    # 안전 복사
-    out = pd.DataFrame()
-    if rank_col:  out["rank"] = df[rank_col]
-    if brand_col: out["brand"] = df[brand_col]
-    if name_col:  out["raw_name"] = df[name_col]
-    if url_col:   out["url"] = df[url_col]
-
-    # 숫자 변환
-    if "rank" in out.columns:
-        out["rank"] = pd.to_numeric(out["rank"], errors="coerce")
-
-    return out
-
-def load_week_dataframe(src: str, data_dir: str, start: date, end: date, topn: int) -> pd.DataFrame:
-    files = load_daily_files_for_range(src, data_dir, start, end)
+def load_week_df(src: str, data_dir: str, start: date, end: date, topn: int) -> pd.DataFrame:
+    files = load_files_for_range(src, data_dir, start, end)
     frames = []
-    for path in files:
-        d = parse_date_from_filename(os.path.basename(path))
-        df = unify_columns(read_csv_any(path))
-        if "rank" not in df.columns:
+    for p in files:
+        d = parse_date_from_filename(os.path.basename(p))
+        df = unify_cols(read_csv_any(p))
+        if "rank" not in df.columns: 
             continue
-        df = df[df["rank"].notnull()]
-        df = df.sort_values("rank").head(topn).copy()
+        df = df[df["rank"].notnull()].sort_values("rank").head(topn).copy()
         df["date"] = pd.to_datetime(d)
         df["date_str"] = df["date"].dt.strftime("%Y-%m-%d")
         frames.append(df)
     if not frames:
         return pd.DataFrame(columns=["rank","brand","raw_name","url","date","date_str"])
-    out = pd.concat(frames, ignore_index=True)
-    # 빈 brand/raw_name 채움
-    out["brand"] = out.get("brand", pd.Series(dtype=str)).fillna("").astype(str)
-    out["raw_name"] = out.get("raw_name", pd.Series(dtype=str)).fillna("").astype(str)
-    out["url"] = out.get("url", pd.Series(dtype=str)).fillna("").astype(str)
-    return out
+    return pd.concat(frames, ignore_index=True)
 
-# --------------------------- 주간 집계 ---------------------------
 
+# --------------------------- 주간 통계 ---------------------------
 @dataclass
 class ItemStat:
     sku: str
     raw_name: str
     brand: str
+    url: str
     days: int
     avg_rank: float
     min_rank: float
-    first_rank: float
 
-def build_week_stats(src: str, df: pd.DataFrame, topn: int) -> Tuple[pd.DataFrame, Dict[str, ItemStat]]:
-    if df.empty:
-        return df, {}
-
-    # 식별자 생성
-    url_col = "url"
-    df["sku"] = df.apply(lambda r: extract_sku(r, src, url_col), axis=1)
-
-    # 주간 item 통계
-    g = df.groupby("sku")
+def build_stats(src: str, df: pd.DataFrame, topn: int) -> Dict[str, ItemStat]:
     stats: Dict[str, ItemStat] = {}
-    for sku, sub in g:
-        raw = sub["raw_name"].mode().iloc[0] if not sub["raw_name"].isna().all() else ""
-        br  = sub["brand"].mode().iloc[0] if not sub["brand"].isna().all() else ""
-        days = sub["date_str"].nunique()
-        avg_rank = float(sub["rank"].mean())
-        min_rank = float(sub["rank"].min())
-        first_rank = float(sub.sort_values("date")["rank"].iloc[0])
-        stats[sku] = ItemStat(sku, raw, br, days, avg_rank, min_rank, first_rank)
-    return df, stats
+    if df.empty: 
+        return stats
 
-def compare_prev_week(curr: Dict[str, ItemStat], prev: Dict[str, ItemStat]) -> Dict[str, Optional[float]]:
-    """이전 주 평균과의 차이 (prev_avg - curr_avg >0이면 개선)"""
+    df["sku"] = df.apply(lambda r: extract_sku(r, src), axis=1)
+    for sku, sub in df.groupby("sku"):
+        raw  = sub["raw_name"].mode().iloc[0] if not sub["raw_name"].isna().all() else ""
+        br   = sub["brand"].mode().iloc[0] if not sub["brand"].isna().all() else ""
+        url  = sub["url"].mode().iloc[0] if not sub["url"].isna().all() else ""
+        days = sub["date_str"].nunique()
+        avg  = float(sub["rank"].mean())
+        minr = float(sub["rank"].min())
+        stats[sku] = ItemStat(sku, raw, br, url, days, avg, minr)
+    return stats
+
+def compare_prev(curr: Dict[str, ItemStat], prev: Dict[str, ItemStat]) -> Dict[str, Optional[float]]:
     deltas: Dict[str, Optional[float]] = {}
     for sku, st in curr.items():
         if sku in prev:
-            d = prev[sku].avg_rank - st.avg_rank
-            deltas[sku] = d
+            deltas[sku] = prev[sku].avg_rank - st.avg_rank  # +면 개선(↑)
         else:
-            deltas[sku] = None  # NEW
+            deltas[sku] = None
     return deltas
 
-def brand_daily_counts(df: pd.DataFrame) -> Dict[str, float]:
-    """일별 브랜드 개수 → 일평균"""
-    if df.empty:
-        return {}
+def arrow(d: Optional[float]) -> str:
+    if d is None: return "NEW"
+    val = int(round(abs(d)))
+    if val == 0: return "유지"
+    return f"↑{val}" if d > 0 else f"↓{val}"
+
+def top10_for_display(stats: Dict[str, ItemStat], deltas: Dict[str, Optional[float]]) -> Tuple[List[str], List[Dict]]:
+    # (-유지일, 평균순위, 최저순위) 정렬
+    items = sorted(stats.values(), key=lambda s: (-s.days, s.avg_rank, s.min_rank))[:10]
+    slack_lines, html_items = [], []
+    for i, st in enumerate(items, 1):
+        ar = arrow(deltas.get(st.sku))
+        # Slack: <url|텍스트>
+        link_txt = f"<{st.url}|{st.raw_name}>" if st.url else st.raw_name
+        slack_lines.append(f"{i}. {link_txt} (유지 {st.days}일 · 평균 {st.avg_rank:.1f}위) ({ar})")
+        html_items.append({
+            "idx": i,
+            "name": st.raw_name,
+            "url": st.url,
+            "days": st.days,
+            "avg": round(st.avg_rank, 1),
+            "arrow": ar,
+        })
+    return slack_lines, html_items
+
+def brand_daily_avg(df: pd.DataFrame) -> Dict[str, float]:
+    if df.empty: return {}
     outs = []
     for d, sub in df.groupby("date_str"):
-        counts = Counter([str(b) for b in sub["brand"].fillna("").tolist()])
-        outs.append(counts)
+        cnt = Counter([str(x) for x in sub["brand"].fillna("").tolist() if str(x).strip()])
+        outs.append(cnt)
     total = Counter()
     for c in outs:
         total.update(c)
     days = max(1, len(outs))
-    avg = {k: round(v / days, 1) for k, v in total.items() if k.strip()}
+    avg = {k: round(v / days, 1) for k, v in total.items()}
     return dict(sorted(avg.items(), key=lambda x: (-x[1], x[0])))
 
-def inout_daily_average(df: pd.DataFrame, src: str) -> float:
-    """일일 교체(IN=OUT) 평균 개수"""
+def inout_avg_per_day(df: pd.DataFrame, src: str) -> float:
     if df.empty: return 0.0
-    url_col = "url"
-    df["sku"] = df.apply(lambda r: extract_sku(r, src, url_col), axis=1)
+    df["sku"] = df.apply(lambda r: extract_sku(r, src), axis=1)
     days = sorted(df["date_str"].unique())
     if len(days) <= 1: return 0.0
     changes = []
     prev_set = set()
     for d in days:
-        now_set = set(df[df["date_str"]==d]["sku"])
+        now = set(df[df["date_str"]==d]["sku"])
         if prev_set:
-            changes.append(len(now_set - prev_set))  # IN == OUT
-        prev_set = now_set
+            changes.append(len(now - prev_set))  # IN == OUT
+        prev_set = now
     return round(sum(changes)/len(changes), 1) if changes else 0.0
 
-def hero_flash_lists(stats: Dict[str, ItemStat], prev_stats: Dict[str, ItemStat]) -> Tuple[List[str], List[str]]:
-    """
-    히어로: 3일 이상 유지 & 지난주엔 없었음
-    반짝: 2일 이하 유지
-    """
+def hero_and_flash(stats: Dict[str, ItemStat], prev_stats: Dict[str, ItemStat]) -> Tuple[List[str], List[str]]:
     heroes, flashes = [], []
     for sku, st in stats.items():
         if st.days >= 3 and sku not in prev_stats:
@@ -355,8 +332,8 @@ def hero_flash_lists(stats: Dict[str, ItemStat], prev_stats: Dict[str, ItemStat]
             flashes.append(st.raw_name)
     return heroes[:10], flashes[:10]
 
-def kw_summary(df: pd.DataFrame) -> Dict[str, any]:
-    """마케팅/인플/성분 요약 (주간 유니크 SKU 기준)"""
+def kw_summary(src: str, df: pd.DataFrame) -> Dict[str, any]:
+    """주간 유니크 SKU 기준. 인플루언서는 oy_kor만 집계."""
     out = {
         "unique": 0,
         "marketing": defaultdict(int),
@@ -365,54 +342,37 @@ def kw_summary(df: pd.DataFrame) -> Dict[str, any]:
     }
     if df.empty: return {"unique": 0, "marketing":{}, "influencers":{}, "ingredients":{}}
 
-    url_col = "url"
-    df["sku"] = df.apply(lambda r: extract_sku(r, "oy_kor", url_col), axis=1)  # src 무관: sku만 필요
+    df = df.copy()
+    df["sku"] = df.apply(lambda r: extract_sku(r, src), axis=1)
     uniq = set()
-    seen_mk = set()  # (sku, key) 1회만 카운트
+    seen_mk = set()
     for _, r in df.iterrows():
         sku = r["sku"]
         raw = (r.get("raw_name") or "").strip()
         uniq.add(sku)
+
         mk, infl = parse_marketing_and_infl(raw)
+        # 마케팅: 유니크 SKU 기준 1회
         for k, v in mk.items():
             if v and (sku, k) not in seen_mk:
                 out["marketing"][k] += 1
-                seen_mk.add((sku,k))
-        if infl:
+                seen_mk.add((sku, k))
+        # 인플: 오직 oy_kor일 때만
+        if src == "oy_kor" and infl:
             out["influencers"][infl] += 1
+        # 성분
         for ing in extract_ingredients(raw, INGR_WORDS):
             out["ingredients"][ing] += 1
+
     out["unique"] = len(uniq)
-    # 정렬
     out["marketing"]   = dict(sorted(out["marketing"].items(),   key=lambda x: (-x[1], x[0])))
     out["influencers"] = dict(sorted(out["influencers"].items(), key=lambda x: (-x[1], x[0])))
     out["ingredients"] = dict(sorted(out["ingredients"].items(), key=lambda x: (-x[1], x[0])))
     return out
 
-# --------------------------- 포맷팅(Slack) ---------------------------
 
-def arrow_from_delta(d: Optional[float]) -> str:
-    if d is None: return "NEW"
-    val = int(round(abs(d)))
-    if val == 0: return "유지"
-    return f"↑{val}" if d > 0 else f"↓{val}"
-
-def format_top10(stats: Dict[str, ItemStat], deltas: Dict[str, Optional[float]]) -> List[str]:
-    # 평균 순위 낮음(좋음) 우선
-    items = sorted(stats.values(), key=lambda s: (s.avg_rank, s.min_rank))[:10]
-    out = []
-    for i, st in enumerate(items, 1):
-        line = f"{i}. {st.raw_name} (유지 {st.days}일 · 평균 {st.avg_rank:.1f}위) {arrow_from_delta(deltas.get(st.sku))}"
-        out.append(line)
-    return out
-
-def format_brand_lines(avg_counts: Dict[str, float], limit: int = 15) -> List[str]:
-    lines = []
-    for k, v in list(avg_counts.items())[:limit]:
-        lines.append(f"{k} {v}개/일")
-    return lines
-
-def format_kw_block(kw: Dict[str, any]) -> str:
+# --------------------------- 포맷(슬랙/JSON) ---------------------------
+def format_kw_for_slack(kw: Dict[str, any]) -> str:
     if kw.get("unique",0) == 0:
         return "데이터 없음"
     lines = []
@@ -425,131 +385,131 @@ def format_kw_block(kw: Dict[str, any]) -> str:
             lines.append(f"  - {k}: {cnt}개 ({ratio}%)")
     if kw["influencers"]:
         lines.append("• *인플루언서*")
-        for k, cnt in list(kw["influencers"].items())[:20]:
+        for k, cnt in kw["influencers"].items():
             lines.append(f"  - {k}: {cnt}개")
     if kw["ingredients"]:
         lines.append("• *성분 키워드*")
-        for k, cnt in list(kw["ingredients"].items())[:20]:
+        for k, cnt in kw["ingredients"].items():
             lines.append(f"  - {k}: {cnt}개")
     return "\n".join(lines)
 
-def build_slack_message(src: str,
-                        range_str: str,
-                        top10_lines: List[str],
-                        brand_lines: List[str],
-                        inout_avg: float,
-                        heroes: List[str],
-                        flashes: List[str],
-                        kw_text: str) -> str:
+def format_brand_lines(avg_counts: Dict[str, float], limit: int = 15) -> List[str]:
+    return [f"{k} {v}개/일" for k, v in list(avg_counts.items())[:limit]]
+
+def build_slack(src: str, range_str: str,
+                top10_lines: List[str],
+                brand_lines: List[str],
+                inout_avg: float,
+                heroes: List[str],
+                flashes: List[str],
+                kw_text: str,
+                unique_cnt: int,
+                keep_days_mean: float) -> str:
     title = SRC_SPECS[src]["title"]
     lines = []
     lines.append(f"📈 *주간 리포트 · {title} ({range_str})*")
     lines.append("")
-    # Top10
     lines.append("🏆 *Top10*")
-    if top10_lines:
-        lines += [f"{ln}" for ln in top10_lines]
-    else:
-        lines.append("데이터 없음")
+    lines += (top10_lines or ["데이터 없음"])
     lines.append("")
-    # 브랜드
     lines.append("📦 *브랜드 개수(일평균)*")
-    if brand_lines:
-        lines += [f"{ln}" for ln in brand_lines]
-    else:
-        lines.append("데이터 없음")
+    lines += (brand_lines or ["데이터 없음"])
     lines.append("")
-    # 인앤아웃
     lines.append("🔁 *인앤아웃(교체)*")
     lines.append(f"- 일평균 {inout_avg}개")
     lines.append("")
-    # 신규/반짝
     lines.append("🆕 *신규 히어로(≥3일 유지)*")
     lines.append("없음" if not heroes else "· " + " · ".join(heroes[:8]))
     lines.append("✨ *반짝 아이템(≤2일)*")
     lines.append("없음" if not flashes else "· " + " · ".join(flashes[:8]))
     lines.append("")
-    # 키워드 블록
+    lines.append("📌 *통계*")
+    lines.append(f"- Top{SRC_SPECS[src]['topn']} 등극 SKU : {unique_cnt}개")
+    lines.append(f"- Top {SRC_SPECS[src]['topn']} 유지 평균 : {keep_days_mean:.1f}일")
+    lines.append("")
     lines.append(kw_text)
     return "\n".join(lines)
 
-# --------------------------- 메인 파이프라인 ---------------------------
 
-def run_for_source(src: str, data_dir: str, min_days: int = 3) -> Dict[str, any]:
+# ------------------------------ 메인 ------------------------------
+def run_for_source(src: str, data_dir: str) -> Dict[str, any]:
     spec = SRC_SPECS[src]
     topn = spec["topn"]
-    # 주차
+
+    # 주 범위
     start, end = last_complete_week()
     prev_start, prev_end = prev_week_range(start, end)
-    range_str = f"{start.strftime('%Y-%m-%d')}-{end.strftime('%Y-%m-%d')}"
+    range_str = f"{start:%Y-%m-%d}-{end:%Y-%m-%d}"
 
-    # 데이터 적재
-    cur_df = load_week_dataframe(src, data_dir, start, end, topn)
-    prev_df = load_week_dataframe(src, data_dir, prev_start, prev_end, topn)
+    # 데이터
+    cur_df  = load_week_df(src, data_dir, start, end, topn)
+    prev_df = load_week_df(src, data_dir, prev_start, prev_end, topn)
 
-    # 통계
-    cur_df, cur_stats = build_week_stats(src, cur_df, topn)
-    _, prev_stats = build_week_stats(src, prev_df, topn)
-    deltas = compare_prev_week(cur_stats, prev_stats)
+    cur_stats  = build_stats(src, cur_df,  topn)
+    prev_stats = build_stats(src, prev_df, topn)
+
+    deltas = compare_prev(cur_stats, prev_stats)
 
     # Top10
-    top10_lines = format_top10(cur_stats, deltas)
+    top10_lines, top10_html_items = top10_for_display(cur_stats, deltas)
 
-    # 브랜드 일평균
-    brand_avg = brand_daily_counts(cur_df)
-    brand_lines = format_brand_lines(brand_avg)
+    # 브랜드/인앤아웃/히어로
+    brand_lines = format_brand_lines(brand_daily_avg(cur_df))
+    inout_avg   = inout_avg_per_day(cur_df, src)
+    heroes, flashes = hero_and_flash(cur_stats, prev_stats)
 
-    # 인앤아웃
-    inout_avg = inout_daily_average(cur_df, src)
+    # 키워드
+    kw  = kw_summary(src, cur_df)
+    kw_text = format_kw_for_slack(kw)
 
-    # 히어로/반짝
-    heroes, flashes = hero_flash_lists(cur_stats, prev_stats)
+    # 통계
+    unique_cnt = len(cur_stats)
+    keep_days_mean = 0.0
+    if cur_df.shape[0] > 0:
+        # SKU별 유지일 평균
+        keep_days_mean = sum(st.days for st in cur_stats.values()) / max(1, len(cur_stats))
 
-    # 키워드 분석(주간 전체 df 기준)
-    kw = kw_summary(cur_df)
-    kw_text = format_kw_block(kw)
-
-    # 슬랙 메시지
-    slack_text = build_slack_message(
-        src, range_str, top10_lines, brand_lines, inout_avg, heroes, flashes, kw_text
+    # 슬랙 텍스트
+    slack_text = build_slack(
+        src, range_str, top10_lines, brand_lines, inout_avg, heroes, flashes,
+        kw_text, unique_cnt, keep_days_mean
     )
-
-    # 파일 저장
     with open(f"slack_{src}.txt", "w", encoding="utf-8") as f:
         f.write(slack_text)
 
+    # 요약 JSON (HTML 생성을 위해 anchor 정보 포함)
     summary = {
         "range": range_str,
-        "top10_lines": top10_lines or ["데이터 없음"],
+        "title": SRC_SPECS[src]["title"],
+        "topn": topn,
+        "top10_items": top10_html_items,      # [{name,url,days,avg,arrow}]
         "brand_lines": brand_lines or ["데이터 없음"],
         "inout_avg": inout_avg,
         "heroes": heroes,
         "flashes": flashes,
-        "kw": kw,  # 원자료(비율은 unique로 계산)
+        "kw": kw,
+        "unique_cnt": unique_cnt,
+        "keep_days_mean": round(keep_days_mean, 1),
     }
     with open(f"weekly_summary_{src}.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
 
     return summary
 
-# --------------------------- CLI ---------------------------
-
 def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--src", choices=list(SRC_SPECS.keys()) + ["all"], required=True)
-    p.add_argument("--data-dir", default="./data/daily")
-    p.add_argument("--min-days", type=int, default=3, help="히어로 판정 최소 유지일(기본 3)")
-    p.add_argument("--split", action="store_true", help="(호환용) 의미 없음")
-    args = p.parse_args()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--src", choices=list(SRC_SPECS.keys()) + ["all"], required=True)
+    ap.add_argument("--data-dir", default="./data/daily")
+    args = ap.parse_args()
 
     if args.src == "all":
         results = {}
         for s in SRC_SPECS.keys():
             print(f"[run] {s}")
-            results[s] = run_for_source(s, args.data_dir, args.min_days)
+            results[s] = run_for_source(s, args.data_dir)
         print(json.dumps(results, ensure_ascii=False, indent=2))
     else:
-        res = run_for_source(args.src, args.data_dir, args.min_days)
+        res = run_for_source(args.src, args.data_dir)
         print(json.dumps(res, ensure_ascii=False, indent=2))
 
 if __name__ == "__main__":
