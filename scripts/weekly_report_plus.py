@@ -343,13 +343,14 @@ def inout_avg_per_day(df: pd.DataFrame, src: str) -> float:
         prev_set = now
     return round(sum(changes)/len(changes), 1) if changes else 0.0
 
-def hero_and_flash(stats: Dict[str, ItemStat], prev_stats: Dict[str, ItemStat]) -> Tuple[List[str], List[str]]:
-    heroes, flashes = [], []
-    for sku, st in stats.items():
-        if st.days >= 3 and sku not in prev_stats:
-            heroes.append(st.raw_name)
-        if st.days <= 2:
-            flashes.append(st.raw_name)
+def hero_and_flash(stats: Dict[str, ItemStat], prev_stats: Dict[str, ItemStat]):
+    # 히어로: 이번 주 3일 이상 유지 & 지난 주엔 없던 상품
+    heroes = [st for sku, st in stats.items() if st.days >= 3 and sku not in prev_stats]
+    # 반짝: 이번 주 2일 이하
+    flashes = [st for _, st in stats.items() if st.days <= 2]
+
+    heroes.sort(key=lambda s: (-s.days, s.avg_rank, s.min_rank))
+    flashes.sort(key=lambda s: (s.days, s.avg_rank, s.min_rank))
     return heroes[:10], flashes[:10]
 
 def parse_marketing_and_infl(raw_name: str) -> Tuple[Dict[str, bool], Optional[str]]:
@@ -440,15 +441,9 @@ def format_kw_for_slack(kw: Dict[str, any]) -> str:
 def format_brand_lines(avg_counts: Dict[str, float], limit: int = 15) -> List[str]:
     return [f"{k} {v}개/일" for k, v in list(avg_counts.items())[:limit]]
 
-def build_slack(src: str, range_str: str,
-                top10_lines: List[str],
-                brand_lines: List[str],
-                inout_avg: float,
-                heroes: List[str],
-                flashes: List[str],
-                kw_text: str,
-                unique_cnt: int,
-                keep_days_mean: float) -> str:
+# 교체: build_slack(...) 내부의 히어로/반짝 출력 부분
+def build_slack(src, range_str, top10_lines, brand_lines, inout_avg,
+                heroes, flashes, kw_text, unique_cnt, keep_days_mean):
     title = SRC_SPECS[src]["title"]
     lines = []
     lines.append(f"📈 *주간 리포트 · {title} ({range_str})*")
@@ -462,10 +457,25 @@ def build_slack(src: str, range_str: str,
     lines.append("🔁 *인앤아웃(교체)*")
     lines.append(f"- 일평균 {inout_avg}개")
     lines.append("")
+
+    # ▼ 히어로: 세로 + 링크
     lines.append("🆕 *신규 히어로(≥3일 유지)*")
-    lines.append("없음" if not heroes else "· " + " · ".join(heroes[:8]))
+    if not heroes:
+        lines.append("없음")
+    else:
+        for st in heroes:
+            nm = f"<{st.url}|{st.raw_name}>" if st.url else st.raw_name
+            lines.append(f"- {nm} (유지 {st.days}일 · 평균 {st.avg_rank:.1f}위)")
+
+    # ▼ 반짝: 세로 + 링크
     lines.append("✨ *반짝 아이템(≤2일)*")
-    lines.append("없음" if not flashes else "· " + " · ".join(flashes[:8]))
+    if not flashes:
+        lines.append("없음")
+    else:
+        for st in flashes:
+            nm = f"<{st.url}|{st.raw_name}>" if st.url else st.raw_name
+            lines.append(f"- {nm} (유지 {st.days}일 · 평균 {st.avg_rank:.1f}위)")
+
     lines.append("")
     lines.append("📌 *통계*")
     lines.append(f"- Top{SRC_SPECS[src]['topn']} 등극 SKU : {unique_cnt}개")
@@ -473,7 +483,6 @@ def build_slack(src: str, range_str: str,
     lines.append("")
     lines.append(kw_text)
     return "\n".join(lines)
-
 
 # ------------------------------ 메인 ------------------------------
 def run_for_source(src: str, data_dir: str) -> Dict[str, any]:
