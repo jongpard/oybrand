@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-주간 리포트 생성 (SKU 표준화 포함)
+주간 리포트 생성 (SKU 표준화 + 날짜 비교 버그 Fix)
 - 사용 예: python scripts/weekly_report_plus.py --src all --data-dir ./data/daily
 - 출력:
   - slack_oy_kor.txt, slack_oy_global.txt, slack_amazon_us.txt, slack_qoo10_jp.txt, slack_daiso_kr.txt
@@ -63,13 +63,11 @@ TOPN = {
 
 def this_week_range(today: Optional[datetime] = None) -> tuple[datetime, datetime]:
     """
-    이번 주 월요일~일요일 범위(로컬 날짜 기준).
-    (GitHub Actions에서는 UTC, 한국기준이면 KST 보정이 필요하지만 여기서는 단순 계산)
+    이번 주 월요일~일요일 범위(UTC 기준 단순 계산).
     """
     if today is None:
         today = datetime.utcnow()
-    # 월요일=0
-    monday = today - timedelta(days=today.weekday())
+    monday = today - timedelta(days=today.weekday())  # 월요일
     monday = datetime(monday.year, monday.month, monday.day)
     sunday = monday + timedelta(days=6)
     return monday, sunday
@@ -100,14 +98,7 @@ def read_csv_safe(path: Path) -> Optional[pd.DataFrame]:
 
 def rename_common_columns(df: pd.DataFrame, src: str) -> pd.DataFrame:
     """
-    소스별로 들쭉날쭉한 컬럼명을 공통 키로 맞춘다.
-    최소한 아래 키만 맞춘다:
-    - date
-    - rank
-    - product_name
-    - brand
-    - url
-    - asin / product_code (그대로 유지)
+    컬럼 공통화: date, rank, product_name, brand, url 최소 보정
     """
     df = df.copy()
 
@@ -118,12 +109,14 @@ def rename_common_columns(df: pd.DataFrame, src: str) -> pd.DataFrame:
     # rank 형식 보정
     if "rank" in df.columns:
         df["rank"] = pd.to_numeric(df["rank"], errors="coerce")
-    # date 형식 보정
-    if "date" in df.columns:
-        df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.date
 
-    # brand 없을 수도 있다 (그냥 둠)
-    # url 없는 경우는 거의 없음 (없으면 빈 문자열)
+    # date 형식(문자→datetime) 보정
+    if "date" in df.columns:
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    else:
+        df["date"] = pd.NaT
+
+    # url 없는 경우 대비
     if "url" not in df.columns:
         df["url"] = None
 
@@ -143,7 +136,7 @@ def extract_query_param(url: str, key: str) -> Optional[str]:
 
 def ensure_sku_column(df: pd.DataFrame, src: str) -> pd.DataFrame:
     """
-    소스별로 공통 sku 컬럼 생성:
+    소스별 공통 sku 생성:
       oy_kor    -> url?goodsNo
       oy_global -> url?productId
       amazon_us -> asin
@@ -176,7 +169,6 @@ def ensure_sku_column(df: pd.DataFrame, src: str) -> pd.DataFrame:
         df["sku"] = df["sku"].astype(str).str.strip()
         df["sku"] = df["sku"].replace({"": None, "None": None})
     else:
-        # 그래도 없으면 url을 fallback (중복 가능성 큼)
         df["sku"] = df.get("url")
 
     return df
@@ -206,20 +198,15 @@ def load_week_df(src: str, data_dir: Path, start: datetime, end: datetime) -> pd
             continue
         df = rename_common_columns(df, src)
 
-        # 파일명 일자를 date 결측에 채워넣기 (없으면)
-        if "date" in df.columns:
-            # 일부 파일에 date가 전부 NaT인 경우 보완
-            if df["date"].isna().all():
-                d = parse_date_from_filename(f.name, src)
-                if d:
-                    df["date"] = d.date()
-        else:
+        # 파일명 일자를 date 결측에 채워넣기
+        if df["date"].isna().all():
             d = parse_date_from_filename(f.name, src)
-            df["date"] = d.date() if d else None
+            if d:
+                df["date"] = pd.to_datetime(d)  # datetime64[ns]
 
         df = ensure_sku_column(df, src)
 
-        # 기본 정렬/필터
+        # 순위만 남기기
         if "rank" in df.columns:
             df = df[df["rank"].notna()]
         frames.append(df)
@@ -228,9 +215,14 @@ def load_week_df(src: str, data_dir: Path, start: datetime, end: datetime) -> pd
         return pd.DataFrame()
 
     out = pd.concat(frames, ignore_index=True)
-    # 범위로 한 번 더 필터링
-    out = out[(pd.to_datetime(out["date"], errors="coerce") >= start.date()) &
-              (pd.to_datetime(out["date"], errors="coerce") <= end.date())]
+
+    # ✅ 날짜 비교 버그 FIX: 양쪽 모두 Timestamp로 맞춰서 비교
+    col_dt = pd.to_datetime(out["date"], errors="coerce").dt.normalize()
+    start_ts = pd.Timestamp(start.date())
+    end_ts   = pd.Timestamp(end.date())
+    mask = (col_dt >= start_ts) & (col_dt <= end_ts)
+    out = out[mask]
+
     return out
 
 
@@ -249,7 +241,7 @@ def calc_weekly_stats(df: pd.DataFrame, src: str) -> WeeklyStats:
     if df is None or len(df) == 0:
         return WeeklyStats(unique_cnt=0, keep_days_mean=0.0, topn_items=[])
 
-    # product_name 보정
+    # 필수 컬럼 보정
     if "product_name" not in df.columns:
         df["product_name"] = None
     if "brand" not in df.columns:
@@ -257,12 +249,13 @@ def calc_weekly_stats(df: pd.DataFrame, src: str) -> WeeklyStats:
 
     # sku 기준으로 일수/평균순위 계산
     g = df.groupby("sku", dropna=True)
+    # 날짜가 datetime64[ns]라고 가정
     days = g["date"].nunique().rename("days")
     avg_rank = g["rank"].mean().rename("avg_rank")
 
-    # 최신(최신일자) product_name/brand/rank
-    df["dt"] = pd.to_datetime(df["date"], errors="coerce")
-    latest_idx = df.sort_values(["sku", "dt"], ascending=[True, False]).groupby("sku").head(1).set_index("sku")
+    # 최신 스냅샷
+    df["__dt"] = pd.to_datetime(df["date"], errors="coerce")
+    latest_idx = df.sort_values(["sku", "__dt"], ascending=[True, False]).groupby("sku").head(1).set_index("sku")
     latest_name = latest_idx["product_name"].rename("latest_name")
     latest_brand = latest_idx["brand"].rename("latest_brand")
     latest_rank = latest_idx["rank"].rename("latest_rank")
@@ -270,8 +263,7 @@ def calc_weekly_stats(df: pd.DataFrame, src: str) -> WeeklyStats:
     stat_df = pd.concat([days, avg_rank, latest_name, latest_brand, latest_rank], axis=1).reset_index()
     stat_df = stat_df[stat_df["sku"].notna()]
 
-    # 상위 TOPN 선정 (avg_rank 오름차순)
-    n = TOPN.get(src, 100)
+    # 상위 10개 (평균순위 오름차순)
     stat_df = stat_df.sort_values(["avg_rank", "latest_rank"], ascending=[True, True]).head(10)
 
     items = []
@@ -285,7 +277,6 @@ def calc_weekly_stats(df: pd.DataFrame, src: str) -> WeeklyStats:
             "days": int(row.get("days")) if pd.notna(row.get("days")) else 0,
         })
 
-    # 전체 유니크 / 평균 유지일
     unique_cnt = df["sku"].nunique(dropna=True)
     keep_days_mean = float(days.mean()) if not days.empty else 0.0
 
@@ -304,11 +295,8 @@ def format_top10_lines(stats: WeeklyStats) -> List[str]:
 
     for i, it in enumerate(stats.topn_items, start=1):
         name = it.get("name") or "-"
-        brand = it.get("brand") or "-"
         avg_rank = it.get("avg_rank")
-        latest_rank = it.get("latest_rank")
         days = it.get("days", 0)
-        # 예: "1. 브랜드 제품명 (유지 7일 · 평균 3.2위)"
         s = f"{i}. {name} (유지 {days}일 · 평균 {avg_rank:.1f}위)" if avg_rank else f"{i}. {name}"
         lines.append(s)
     return lines
