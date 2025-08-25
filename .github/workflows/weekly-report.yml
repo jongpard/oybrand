@@ -12,6 +12,8 @@ jobs:
       fail-fast: false
       matrix:
         src: [oy_kor, oy_global, amazon_us, qoo10_jp, daiso_kr]
+    env:
+      SRC: ${{ matrix.src }}
 
     steps:
       - uses: actions/checkout@v4
@@ -20,13 +22,27 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install tools
+      - name: Install tools & libs
         run: |
           sudo apt-get update
           sudo apt-get install -y jq
           python -m pip install --upgrade pip
-          pip install pandas
+          pip install pandas google-api-python-client google-auth-httplib2 google-auth-oauthlib
 
+      # 1) 구글 드라이브에서 일일 CSV 내려받기 (필수)
+      - name: Fetch daily CSVs from Google Drive
+        env:
+          GOOGLE_CLIENT_ID:     ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+          GDRIVE_FOLDER_ID:     ${{ secrets.GDRIVE_FOLDER_ID }}
+        run: |
+          mkdir -p data/daily
+          python scripts/fetch_from_gdrive.py
+          echo "== downloaded files in data/daily ==" 
+          ls -al data/daily || true
+
+      # 2) 주간 리포트 생성(소스별)
       - name: Generate weekly report (per source)
         env:
           DATA_DIR: ./data/daily
@@ -34,25 +50,25 @@ jobs:
           FLASH_MAX_DAYS: 2
         run: |
           python scripts/weekly_report_plus.py \
-            --src ${{ matrix.src }} \
+            --src "${SRC}" \
             --split \
             --data-dir "$DATA_DIR" \
             --min-days $MIN_DAYS
 
       - name: Ensure report files exist
         run: |
-          for f in "slack_${{ matrix.src }}.txt" "weekly_summary_${{ matrix.src }}.json"; do
+          for f in "slack_${SRC}.txt" "weekly_summary_${SRC}.json"; do
             if [ ! -f "$f" ]; then echo "데이터 없음" > "$f"; fi
           done
 
-      # ---------- Slack ----------
+      # 3) 슬랙 전송
       - name: Send to Slack (only if webhook exists)
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         shell: bash
         run: |
           if [ -n "$SLACK_WEBHOOK_URL" ]; then
-            BODY=$(jq -Rs . < "slack_${{ matrix.src }}.txt")
+            BODY=$(jq -Rs . < "slack_${SRC}.txt")
             curl -sS -X POST -H 'Content-type: application/json' \
               --data "{\"text\": ${BODY} }" \
               "$SLACK_WEBHOOK_URL"
@@ -60,34 +76,36 @@ jobs:
             echo "SLACK_WEBHOOK_URL 비어있음 → 스킵"
           fi
 
-      # ---------- Email ----------
+      # 4) 메일 본문/제목 안전하게 읽기 (EOF 이슈 회피)
+      - id: read_body
+        uses: actions/github-script@v7
+        env:
+          SRC: ${{ matrix.src }}
+        with:
+          script: |
+            const fs = require('fs');
+            const txt = fs.readFileSync(`slack_${process.env.SRC}.txt`, 'utf8');
+            core.setOutput('text', txt);
+
       - id: meta
-        shell: bash
-        run: |
-          RANGE=$(jq -r '.range // "데이터 없음"' "weekly_summary_${{ matrix.src }}.json")
-          case "${{ matrix.src }}" in
-            oy_kor)    TITLE="올리브영 국내 Top100" ;;
-            oy_global) TITLE="올리브영 글로벌 Top100" ;;
-            amazon_us) TITLE="아마존 US Top100" ;;
-            qoo10_jp)  TITLE="큐텐 재팬 뷰티 Top200" ;;
-            daiso_kr)  TITLE="다이소몰 뷰티/위생 Top200" ;;
-          esac
-          {
-            echo "range=$RANGE"
-            echo "title=$TITLE"
-          } >> "$GITHUB_OUTPUT"
+        uses: actions/github-script@v7
+        env:
+          SRC: ${{ matrix.src }}
+        with:
+          script: |
+            const fs = require('fs');
+            const m = JSON.parse(fs.readFileSync(`weekly_summary_${process.env.SRC}.json`, 'utf8'));
+            const titleMap = {
+              oy_kor: '올리브영 국내 Top100',
+              oy_global: '올리브영 글로벌 Top100',
+              amazon_us: '아마존 US Top100',
+              qoo10_jp: '큐텐 재팬 뷰티 Top200',
+              daiso_kr: '다이소몰 뷰티/위생 Top200'
+            };
+            core.setOutput('title', titleMap[process.env.SRC] || process.env.SRC);
+            core.setOutput('range', m.range || '데이터 없음');
 
-      # ✅ 멀티라인 output을 '고유 구분자'로 안전하게 기록
-      - id: body
-        shell: bash
-        run: |
-          DELIM="BODY_$(date +%s)_$RANDOM"
-          {
-            echo "text<<$DELIM"
-            cat "slack_${{ matrix.src }}.txt"
-            echo "$DELIM"
-          } >> "$GITHUB_OUTPUT"
-
+      # 5) 메일 발송
       - name: Send report via Email
         uses: dawidd6/action-send-mail@v3
         with:
@@ -99,7 +117,7 @@ jobs:
           to: ${{ secrets.MAIL_TO }}
           subject: "[주간 리포트] ${{ steps.meta.outputs.title }} (${{ steps.meta.outputs.range }})"
           content_type: text/plain; charset=UTF-8
-          body: ${{ steps.body.outputs.text }}
+          body: ${{ steps.read_body.outputs.text }}
           attachments: |
-            weekly_summary_${{ matrix.src }}.json
-            slack_${{ matrix.src }}.txt
+            weekly_summary_${{ env.SRC }}.json
+            slack_${{ env.SRC }}.txt
