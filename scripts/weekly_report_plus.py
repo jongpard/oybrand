@@ -505,32 +505,64 @@ def summarize_week(ud:pd.DataFrame, src:str, min_days:int=3):
 
 # --------- 슬랙 포맷 ---------
 def format_slack_block(src:str, s:dict)->str:
-    title_map={'oy_kor':"올리브영 국내 Top100",'oy_global':"올리브영 글로벌 Top100",
-               'amazon_us':"아마존 US Top100",'qoo10_jp':"큐텐 재팬 뷰티 Top200",'daiso_kr':"다이소몰 뷰티/위생 Top200"}
-    L=[]
-    L.append(f"📊 주간 리포트 · {title_map.get(src,src)} ({s['range']})")
-    L.append("🏆 Top10"); L.extend(s.get('top10_lines') or ["데이터 없음"]); L.append("")
-    L.append("🍞 브랜드 개수(일평균)"); L.extend(s.get('brand_lines') or ["데이터 없음"]); L.append("")
-    # 인앤아웃(교체): 일평균만
-    L.append(f"🔁 인앤아웃(교체): {s.get('inout','비교 기준 없음')}")
-    # 히어로/반짝 – 기준 설명 추가
-    L.append("🆕 신규 히어로(3일 이상 랭크 유지): " + (", ".join(s.get('heroes') or []) if s.get('heroes') else "없음"))
-    L.append("✨ 반짝 아이템(2일 이내 랭크 아웃): " + (", ".join(s.get('flash')  or []) if s.get('flash')  else "없음"))
-    if s.get('cat_top5'): L.append("📈 카테고리 상위: " + " · ".join(s['cat_top5']))
+    title_map = {
+        'oy_kor': "올리브영 국내 Top100",
+        'oy_global': "올리브영 글로벌 Top100",
+        'amazon_us': "아마존 US Top100",
+        'qoo10_jp': "큐텐 재팬 뷰티 Top200",
+        'daiso_kr': "다이소몰 뷰티/위생 Top200",
+    }
+
+    L = []
+    # 제목
+    L.append(f"*📊 주간 리포트 · {title_map.get(src, src)} ({s['range']})*")
+
+    # 소제목들 볼드
+    L.append(f"*🏆 Top10*")
+    L.extend(s.get('top10_lines') or ["데이터 없음"])
+    L.append("")
+
+    L.append(f"*🍞 브랜드 개수(일평균)*")
+    L.extend(s.get('brand_lines') or ["데이터 없음"])
+    L.append("")
+
+    # 인앤아웃(간소화)
+    L.append(f"*🔁 인앤아웃(교체):* {s.get('inout','비교 기준 없음')}")
+
+    # 히어로/반짝 + 기준 설명
+    L.append("*🆕 신규 히어로(3일 이상 랭크 유지):* " + (", ".join(s.get('heroes') or []) if s.get('heroes') else "없음"))
+    L.append("*✨ 반짝 아이템(2일 이내 랭크 아웃):* " + (", ".join(s.get('flash')  or []) if s.get('flash')  else "없음"))
+
+    # 카테고리
+    if s.get('cat_top5'):
+        L.append("*📈 카테고리 상위:* " + " · ".join(s['cat_top5']))
+
+    # 주간 키워드 분석
     if s.get('kw_lines'):
-        L.append("🔎 주간 키워드 분석"); L.extend(s['kw_lines'])
-    tail=[]
-    if s.get('median_price') is not None: tail.append("중위가격 " + (fmt_money(s['median_price'], src) or ""))
-    disc=[]
+        L.append("*🔎 주간 키워드 분석*")
+        L.extend(s['kw_lines'])
+
+    # 가격/할인(소제목 + 상세)
+    tail = []
+    if s.get('median_price') is not None:
+        tail.append("중위가격 " + (fmt_money(s['median_price'], src) or ""))
+    disc = []
     if s.get('discount_all')       is not None: disc.append(f"전체 {s['discount_all']:.2f}%")
     if s.get('discount_promo')     is not None: disc.append(f"프로모션 {s['discount_promo']:.2f}%")
     if s.get('discount_nonpromo')  is not None: disc.append(f"일반 {s['discount_nonpromo']:.2f}%")
     if s.get('discount_delta_same') is not None: disc.append(f"(동일상품 차이 {('+' if s['discount_delta_same']>=0 else '')}{s['discount_delta_same']:.2f}%p)")
     if disc: tail.append("평균 할인율 " + " · ".join(disc))
-    if tail: L.append("💵 " + " / ".join(tail))
+    if tail:
+        L.append("*💵 가격/할인*")
+        L.append(" / ".join(tail))
+
+    # 최종 인사이트
     if s.get('insights'):
-        L.append(""); L.append("🧠 최종 인사이트")
-        for x in s['insights']: L.append(f"- {x}")
+        L.append("")
+        L.append("*🧠 최종 인사이트*")
+        for x in s['insights']:
+            L.append(f"- {x}")
+
     return "\n".join(L)
 
 # --------- 엔트리 ---------
