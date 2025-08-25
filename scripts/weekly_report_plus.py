@@ -40,11 +40,11 @@ SRC_SPECS = {
 }
 
 FILENAME_HINTS = {
-    "oy_kor":    ["올리브영_랭킹", "올리브영 국내", "oy_kor"],
+    "oy_kor":    ["올리브영_랭킹", "올리브영국내", "올리브영 국내", "oy_kor"],
     "oy_global": ["올리브영글로벌", "oy_global"],
-    "amazon_us": ["아마존US", "amazon_us"],
-    "qoo10_jp":  ["큐텐재팬", "큐텐 재팬", "qoo10_jp"],
-    "daiso_kr":  ["다이소몰", "daiso_kr"],
+    "amazon_us": ["아마존US", "amazon_us", "amazon"],
+    "qoo10_jp":  ["큐텐재팬", "큐텐 재팬", "qoo10_jp", "qoo10"],
+    "daiso_kr":  ["다이소몰", "daiso_kr", "daiso"],
 }
 
 RANK_COLS  = ["rank", "순위", "랭킹", "ranking", "Rank"]
@@ -56,12 +56,10 @@ SKU_KEYS = ["goodsNo", "productId", "asin", "product_code", "pdNo", "sku", "id",
 
 
 # ----------------------- 올영픽 / PICK / 성분 -----------------------
-# '올영픽'(프로모션)과 'PICK'(인플루언서)은 별개!
 RE_OY_PICK = re.compile(r"(올영픽|올리브영\s*픽)\b", re.I)
 RE_INFL_PICK = re.compile(r"([가-힣A-Za-z0-9.&/_-]+)\s*(픽|Pick)\b", re.I)
-EXCLUDE_INFL = {"올영", "올리브영", "월올영", "원픽"}  # 인플 후보 제거
+EXCLUDE_INFL = {"올영", "올리브영", "월올영", "원픽"}
 
-# 마케팅 키워드(모두 노출, 병합 금지)
 PAT_MARKETING = {
     "올영픽":     r"(올영픽|올리브영\s*픽)",
     "특가":       r"(특가|핫딜|세일|할인)",
@@ -93,26 +91,6 @@ def load_ingredients() -> List[str]:
 
 INGR_WORDS = load_ingredients()
 
-def parse_marketing_and_infl(raw_name: str) -> Tuple[Dict[str, bool], Optional[str]]:
-    name = raw_name or ""
-    mk = {k: bool(p.search(name)) for k, p in PAT_MARKETING.items()}
-    infl = None
-    m = RE_INFL_PICK.search(name)
-    if m:
-        cand = re.sub(r"[\[\](),.|·]", "", m.group(1)).strip()
-        if cand and cand not in EXCLUDE_INFL and not RE_OY_PICK.search(name):
-            infl = cand
-    return mk, infl
-
-def extract_ingredients(raw_name: str, ingr_list=None) -> List[str]:
-    name = raw_name or ""
-    ingr_list = ingr_list or INGR_WORDS
-    out = []
-    for w in ingr_list:
-        if re.search(re.escape(w), name, re.I):
-            out.append(w)
-    return out
-
 
 # ------------------------------ 유틸 ------------------------------
 def first_existing(cols, candidates) -> Optional[str]:
@@ -131,23 +109,28 @@ def parse_query(url: str, key: str) -> Optional[str]:
     m = re.search(r"[?&]" + re.escape(key) + r"=([^&#]+)", url)
     return m.group(1) if m else None
 
+def normalize_key(s: str) -> str:
+    return re.sub(r"\s+", "", s.lower())
+
 def guess_src_from_filename(fn: str) -> Optional[str]:
+    key = normalize_key(fn)
     for src, hints in FILENAME_HINTS.items():
-        if any(h in fn for h in hints):
-            return src
+        for h in hints:
+            if normalize_key(h) in key:
+                return src
     return None
 
 def parse_date_from_filename(fn: str) -> Optional[date]:
-    m = re.search(r"(\d{4}-\d{2}-\d{2})", fn)
+    # 2025-08-23 / 2025_08_23 / 2025.08.23 허용
+    m = re.search(r"(20\d{2})[-_\.](\d{2})[-_\.](\d{2})", fn)
     if not m:
         return None
     try:
-        return datetime.strptime(m.group(1), "%Y-%m-%d").date()
+        return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
     except Exception:
         return None
 
 def last_complete_week(today: Optional[date] = None) -> Tuple[date, date]:
-    """지난 '일요일' 기준 완결 주(월~일)"""
     today = today or date.today()
     weekday = today.weekday()  # 월=0 ... 일=6
     last_sun = today - timedelta(days=weekday + 1)
@@ -168,7 +151,7 @@ def read_csv_any(path: str) -> pd.DataFrame:
             return pd.read_csv(path, encoding=enc)
         except Exception:
             continue
-    return pd.read_csv(path)  # 마지막 시도
+    return pd.read_csv(path)
 
 def unify_cols(df: pd.DataFrame) -> pd.DataFrame:
     cols = list(df.columns)
@@ -187,9 +170,9 @@ def unify_cols(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 def load_files_for_range(src: str, data_dir: str, start: date, end: date) -> List[str]:
-    """폴더가 없어도 안전하게 빈 리스트 반환(== 데이터 없음 처리)"""
     outs = []
     if not os.path.isdir(data_dir):
+        print(f"[scan] {src}: data_dir not found: {data_dir}")
         return []
     for fn in os.listdir(data_dir):
         full = os.path.join(data_dir, fn)
@@ -200,10 +183,10 @@ def load_files_for_range(src: str, data_dir: str, start: date, end: date) -> Lis
             continue
         if guess_src_from_filename(fn) == src:
             outs.append(full)
+    print(f"[scan] {src}: range {start}~{end} -> {len(outs)} file(s) in {data_dir}")
     return sorted(outs)
 
 def extract_sku(row: Dict, src: str) -> str:
-    # 1) 명시 필드
     for k in SKU_KEYS:
         if k in row and str(row[k]).strip():
             return str(row[k]).strip()
@@ -254,7 +237,6 @@ def build_stats(src: str, df: pd.DataFrame, topn: int) -> Dict[str, ItemStat]:
     stats: Dict[str, ItemStat] = {}
     if df.empty:
         return stats
-
     df["sku"] = df.apply(lambda r: extract_sku(r, src), axis=1)
     for sku, sub in df.groupby("sku"):
         raw  = sub["raw_name"].mode().iloc[0] if not sub["raw_name"].isna().all() else ""
@@ -270,7 +252,7 @@ def compare_prev(curr: Dict[str, ItemStat], prev: Dict[str, ItemStat]) -> Dict[s
     deltas: Dict[str, Optional[float]] = {}
     for sku, st in curr.items():
         if sku in prev:
-            deltas[sku] = prev[sku].avg_rank - st.avg_rank  # +면 개선(↑)
+            deltas[sku] = prev[sku].avg_rank - st.avg_rank
         else:
             deltas[sku] = None
     return deltas
@@ -282,12 +264,10 @@ def arrow(d: Optional[float]) -> str:
     return f"↑{val}" if d > 0 else f"↓{val}"
 
 def top10_for_display(stats: Dict[str, ItemStat], deltas: Dict[str, Optional[float]]) -> Tuple[List[str], List[Dict]]:
-    # (-유지일, 평균순위, 최저순위) 정렬
     items = sorted(stats.values(), key=lambda s: (-s.days, s.avg_rank, s.min_rank))[:10]
     slack_lines, html_items = [], []
     for i, st in enumerate(items, 1):
         ar = arrow(deltas.get(st.sku))
-        # Slack: <url|텍스트>
         link_txt = f"<{st.url}|{st.raw_name}>" if st.url else st.raw_name
         slack_lines.append(f"{i}. {link_txt} (유지 {st.days}일 · 평균 {st.avg_rank:.1f}위) ({ar})")
         html_items.append({
@@ -336,8 +316,27 @@ def hero_and_flash(stats: Dict[str, ItemStat], prev_stats: Dict[str, ItemStat]) 
             flashes.append(st.raw_name)
     return heroes[:10], flashes[:10]
 
+def parse_marketing_and_infl(raw_name: str) -> Tuple[Dict[str, bool], Optional[str]]:
+    name = raw_name or ""
+    mk = {k: bool(p.search(name)) for k, p in PAT_MARKETING.items()}
+    infl = None
+    m = RE_INFL_PICK.search(name)
+    if m:
+        cand = re.sub(r"[\[\](),.|·]", "", m.group(1)).strip()
+        if cand and cand not in EXCLUDE_INFL and not RE_OY_PICK.search(name):
+            infl = cand
+    return mk, infl
+
+def extract_ingredients(raw_name: str, ingr_list=None) -> List[str]:
+    name = raw_name or ""
+    ingr_list = ingr_list or INGR_WORDS
+    out = []
+    for w in ingr_list:
+        if re.search(re.escape(w), name, re.I):
+            out.append(w)
+    return out
+
 def kw_summary(src: str, df: pd.DataFrame) -> Dict[str, any]:
-    """주간 유니크 SKU 기준. 인플루언서는 oy_kor만 집계."""
     out = {
         "unique": 0,
         "marketing": defaultdict(int),
@@ -356,15 +355,14 @@ def kw_summary(src: str, df: pd.DataFrame) -> Dict[str, any]:
         uniq.add(sku)
 
         mk, infl = parse_marketing_and_infl(raw)
-        # 마케팅: 유니크 SKU 기준 1회
         for k, v in mk.items():
             if v and (sku, k) not in seen_mk:
                 out["marketing"][k] += 1
                 seen_mk.add((sku, k))
-        # 인플: 오직 oy_kor일 때만
+
         if src == "oy_kor" and infl:
             out["influencers"][infl] += 1
-        # 성분
+
         for ing in extract_ingredients(raw, INGR_WORDS):
             out["ingredients"][ing] += 1
 
@@ -440,12 +438,10 @@ def run_for_source(src: str, data_dir: str) -> Dict[str, any]:
     spec = SRC_SPECS[src]
     topn = spec["topn"]
 
-    # 주 범위
     start, end = last_complete_week()
     prev_start, prev_end = prev_week_range(start, end)
     range_str = f"{start:%Y-%m-%d}-{end:%Y-%m-%d}"
 
-    # 데이터
     cur_df  = load_week_df(src, data_dir, start, end, topn)
     prev_df = load_week_df(src, data_dir, prev_start, prev_end, topn)
 
@@ -454,26 +450,19 @@ def run_for_source(src: str, data_dir: str) -> Dict[str, any]:
 
     deltas = compare_prev(cur_stats, prev_stats)
 
-    # Top10
     top10_lines, top10_html_items = top10_for_display(cur_stats, deltas)
-
-    # 브랜드/인앤아웃/히어로
     brand_lines = format_brand_lines(brand_daily_avg(cur_df))
     inout_avg   = inout_avg_per_day(cur_df, src)
     heroes, flashes = hero_and_flash(cur_stats, prev_stats)
 
-    # 키워드
     kw  = kw_summary(src, cur_df)
     kw_text = format_kw_for_slack(kw)
 
-    # 통계
     unique_cnt = len(cur_stats)
     keep_days_mean = 0.0
     if cur_df.shape[0] > 0:
-        # SKU별 유지일 평균
         keep_days_mean = sum(st.days for st in cur_stats.values()) / max(1, len(cur_stats))
 
-    # 슬랙 텍스트
     slack_text = build_slack(
         src, range_str, top10_lines, brand_lines, inout_avg, heroes, flashes,
         kw_text, unique_cnt, keep_days_mean
@@ -481,12 +470,11 @@ def run_for_source(src: str, data_dir: str) -> Dict[str, any]:
     with open(f"slack_{src}.txt", "w", encoding="utf-8") as f:
         f.write(slack_text)
 
-    # 요약 JSON (HTML 생성을 위해 anchor 정보 포함)
     summary = {
         "range": range_str,
         "title": SRC_SPECS[src]["title"],
         "topn": topn,
-        "top10_items": top10_html_items,      # [{name,url,days,avg,arrow}]
+        "top10_items": top10_html_items,
         "brand_lines": brand_lines or ["데이터 없음"],
         "inout_avg": inout_avg,
         "heroes": heroes,
@@ -506,7 +494,6 @@ def main():
     ap.add_argument("--data-dir", default="./data/daily")
     args = ap.parse_args()
 
-    # ⬇️ 폴더가 없어도 에러나지 않도록 보장
     os.makedirs(args.data_dir, exist_ok=True)
 
     if args.src == "all":
