@@ -1,4 +1,4 @@
-name: Weekly Report → Email
+name: Weekly Report → Slack & Email
 
 on:
   workflow_dispatch:
@@ -37,10 +37,27 @@ jobs:
             --data-dir "$DATA_DIR" \
             --min-days $MIN_DAYS
 
-      # 메타(제목/기간) 추출
+      - name: Ensure report files exist
+        run: |
+          for f in "slack_${{ matrix.src }}.txt" "weekly_summary_${{ matrix.src }}.json"; do
+            if [ ! -f "$f" ]; then echo "데이터 없음" > "$f"; fi
+          done
+
+      # ---------------- Slack ----------------
+      - name: Send to Slack
+        if: ${{ env.SLACK_WEBHOOK_URL != '' }}
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          BODY=$(jq -Rs . < "slack_${{ matrix.src }}.txt")   # 파일을 JSON 문자열로 인코딩
+          curl -sS -X POST -H 'Content-type: application/json' \
+            --data "{\"text\": ${BODY} }" \
+            "$SLACK_WEBHOOK_URL"
+
+      # -------------- Email ------------------
       - id: meta
         run: |
-          RANGE=$(jq -r '.range // "데이터 없음"' weekly_summary_${{ matrix.src }}.json)
+          RANGE=$(jq -r '.range // "데이터 없음"' "weekly_summary_${{ matrix.src }}.json")
           case "${{ matrix.src }}" in
             oy_kor)    TITLE="올리브영 국내 Top100" ;;
             oy_global) TITLE="올리브영 글로벌 Top100" ;;
@@ -51,15 +68,10 @@ jobs:
           echo "range=$RANGE" >> $GITHUB_OUTPUT
           echo "title=$TITLE" >> $GITHUB_OUTPUT
 
-      # 본문(슬랙 텍스트 파일) 읽기
       - id: body
         run: |
           echo "text<<'EOF'" >> $GITHUB_OUTPUT
-          if [ -f slack_${{ matrix.src }}.txt ]; then
-            cat slack_${{ matrix.src }}.txt >> $GITHUB_OUTPUT
-          else
-            echo "데이터 없음" >> $GITHUB_OUTPUT
-          fi
+          cat "slack_${{ matrix.src }}.txt" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
 
       - name: Send report via Email
