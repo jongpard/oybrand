@@ -56,20 +56,35 @@ jobs:
 
       # 3) 슬랙 전송 (섹션별 순차 전송)
       - name: Post to Slack
-        if: ${{ secrets.SLACK_WEBHOOK_URL != '' }}
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: |
-          post(){
+          # 시크릿 없으면 조용히 스킵
+          if [ -z "${SLACK_WEBHOOK_URL:-}" ]; then
+            echo "No SLACK_WEBHOOK_URL; skip Slack posting."
+            exit 0
+          fi
+
+          post() {
             BODY=$(jq -Rs . < "$1")
             curl -sS -X POST -H 'Content-type: application/json' \
               --data "{\"text\": ${BODY} }" "$SLACK_WEBHOOK_URL" > /dev/null
           }
-          post slack_oy_kor.txt
-          post slack_oy_global.txt
-          post slack_amazon_us.txt
-          post slack_qoo10_jp.txt
-          post slack_daiso_kr.txt
+
+          for f in \
+            slack_oy_kor.txt \
+            slack_oy_global.txt \
+            slack_amazon_us.txt \
+            slack_qoo10_jp.txt \
+            slack_daiso_kr.txt
+          do
+            if [ -f "$f" ]; then
+              post "$f"
+            else
+              echo "skip $f (not found)"
+            fi
+          done
+
 
       # 4) HTML 합본 생성
       - id: build_html
