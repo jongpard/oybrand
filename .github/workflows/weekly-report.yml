@@ -1,13 +1,14 @@
-name: Weekly Report
+name: weekly-report
 
 on:
-  workflow_dispatch:
+  workflow_dispatch: {}
   schedule:
-    - cron: "5 22 * * 0"   # 매주 월요일 KST 오전 7시(UTC 22:05 일요일)
+    - cron: "0 21 * * MON"  # 월요일(UTC) 주간 실행, 필요 시 수정
 
 jobs:
   weekly:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -22,95 +23,69 @@ jobs:
           python -m pip install -U pip
           pip install pandas google-auth google-auth-oauthlib google-api-python-client tzdata
           sudo apt-get update
-          sudo apt-get install -y jq   # ← jq는 apt로 설치해야 curl 전송 단계에서 사용 가능
+          sudo apt-get install -y jq
 
       - name: Prepare data dir
-        run: mkdir -p ./data/daily      # ← 폴더 미리 만들어 두기
+        run: mkdir -p ./data/daily
 
-      # (선택) 구글 드라이브에서 일일 CSV 내려받는 스텝이 있다면 여기
-      # - name: Fetch daily CSVs from Google Drive
-      #   run: python scripts/fetch_from_gdrive.py
+      - name: Debug (before fetch)
+        run: |
+          echo "== before fetch =="
+          find . -maxdepth 2 -type d -print | sed 's/^/DIR  /'
+          find . -maxdepth 2 -type f -name "*.csv" -print | sed 's/^/FILE /'
+
+      # 필요하면 사용 (구글 드라이브에서 CSV 내려받기)
+      - name: Fetch daily CSVs from Google Drive (optional)
+        run: python scripts/fetch_from_gdrive.py
+        continue-on-error: true
+        env:
+          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+
+      - name: Debug (after fetch)
+        run: |
+          echo "== after fetch =="
+          find ./data -maxdepth 2 -type f -name "*.csv" -print | sed 's/^/FILE /'
+          ls -al ./data/daily || true
 
       - name: Generate weekly report (per source)
-        run: |
-          python scripts/weekly_report_plus.py --src all --data-dir ./data/daily
+        run: python scripts/weekly_report_plus.py --src all --data-dir ./data/daily
 
       - name: Ensure report files exist
         run: |
-          ls -al
-          for f in oy_kor oy_global amazon_us qoo10_jp daiso_kr; do
-            test -f "slack_${f}.txt" || echo "경고: slack_${f}.txt 없음"
-            test -f "weekly_summary_${f}.json" || echo "경고: weekly_summary_${f}.json 없음"
-          done
+          test -f weekly_summary_oy_kor.json || echo '{"range":"데이터 없음"}' > weekly_summary_oy_kor.json
+          test -f weekly_summary_oy_global.json || echo '{"range":"데이터 없음"}' > weekly_summary_oy_global.json
+          test -f weekly_summary_amazon_us.json || echo '{"range":"데이터 없음"}' > weekly_summary_amazon_us.json
+          test -f weekly_summary_qoo10_jp.json || echo '{"range":"데이터 없음"}' > weekly_summary_qoo10_jp.json
+          test -f weekly_summary_daiso_kr.json || echo '{"range":"데이터 없음"}' > weekly_summary_daiso_kr.json
 
-      - name: Post to Slack
+      - name: Post to Slack (per source)
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: |
-          if [ -z "${SLACK_WEBHOOK_URL:-}" ]; then
-            echo "No SLACK_WEBHOOK_URL; skip Slack posting."
-            exit 0
-          fi
           post() {
             BODY=$(jq -Rs . < "$1")
             curl -sS -X POST -H 'Content-type: application/json' \
-              --data "{\"text\": ${BODY} }" "$SLACK_WEBHOOK_URL" > /dev/null
+                 --data "{\"text\": ${BODY}}" "$SLACK_WEBHOOK_URL" > /dev/null
           }
-          for f in slack_oy_kor.txt slack_oy_global.txt slack_amazon_us.txt slack_qoo10_jp.txt slack_daiso_kr.txt; do
-            [ -f "$f" ] && post "$f" || echo "skip $f (not found)"
-          done
+          if [ -n "${SLACK_WEBHOOK_URL:-}" ]; then
+            for f in slack_*.txt; do
+              [ -f "$f" ] && post "$f"
+            done
+          else
+            echo "SLACK_WEBHOOK_URL not set; skipping Slack posts."
+          fi
 
-      - id: build_html
-        name: Build HTML
+      - name: Build HTML
+        id: build_html
         run: |
           HTML_FILE=$(python scripts/build_html_report.py)
-          echo "html=${HTML_FILE}" >> $GITHUB_OUTPUT
-          echo "Built: ${HTML_FILE}"
-
-      - name: Upload HTML to Google Drive
-        env:
-          GOOGLE_CLIENT_ID:     ${{ secrets.GOOGLE_CLIENT_ID }}
-          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
-          GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
-          GDRIVE_FOLDER_ID:     ${{ secrets.GDRIVE_FOLDER_ID }}
-        run: |
-          python - << 'PY'
-          import os, sys, json
-          from google.oauth2.credentials import Credentials
-          from googleapiclient.discovery import build
-          from googleapiclient.http import MediaFileUpload
-
-          cid  = os.environ.get("GOOGLE_CLIENT_ID")
-          csec = os.environ.get("GOOGLE_CLIENT_SECRET")
-          rtok = os.environ.get("GOOGLE_REFRESH_TOKEN")
-          folder_id = os.environ.get("GDRIVE_FOLDER_ID")
-          html = os.environ.get("HTML")
-
-          if not html:
-            # GitHub outputs 통해 전달
-            html = os.popen("echo ${{ steps.build_html.outputs.html }}").read().strip()
-
-          if not all([cid, csec, rtok, folder_id, html]) or not os.path.exists(html):
-            print("Skip GDrive upload (missing creds or file).")
-            sys.exit(0)
-
-          creds = Credentials(
-              None,
-              refresh_token=rtok,
-              token_uri="https://oauth2.googleapis.com/token",
-              client_id=cid,
-              client_secret=csec,
-              scopes=["https://www.googleapis.com/auth/drive.file"]
-          )
-          service = build("drive", "v3", credentials=creds)
-          media = MediaFileUpload(html, mimetype="text/html", resumable=True)
-          file_metadata = {"name": os.path.basename(html), "parents": [folder_id]}
-          r = service.files().create(body=file_metadata, media_body=media, fields="id,name").execute()
-          print("Uploaded:", r)
-          PY
+          echo "html=${HTML_FILE}" >> "$GITHUB_OUTPUT"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: weekly-html
+          name: weekly-report
           path: ${{ steps.build_html.outputs.html }}
