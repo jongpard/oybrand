@@ -3,13 +3,11 @@
 
 """
 dist/weekly_report.html 을 Google Drive 지정 폴더로 업로드.
-동일 이름 파일이 있으면 업데이트, 없으면 생성.
+동일 이름 존재시 업데이트, 없으면 생성.
 """
 
 import os
 import sys
-import json
-from datetime import datetime
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -39,20 +37,16 @@ def get_service():
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
 def find_existing(service, folder_id, name):
-    # f-string 표현식에 backslash가 들어가지 않도록 안전 문자열을 미리 만든다.
+    # f-string 내부 표현식에 백슬래시가 들어가지 않도록 선처리
     safe = name.replace("'", "\\'")
     q = f"name = '{safe}' and '{folder_id}' in parents and trashed = false"
-    resp = service.files().list(
-        q=q, spaces="drive",
-        fields="files(id, name)", pageSize=10
-    ).execute()
+    resp = service.files().list(q=q, spaces="drive", fields="files(id,name)", pageSize=10).execute()
     files = resp.get("files", [])
     return files[0]["id"] if files else None
 
 def upload(service, folder_id, path, name):
     file_id = find_existing(service, folder_id, name)
     media = MediaFileUpload(path, mimetype="text/html", resumable=False)
-
     if file_id:
         print(f"[GDRIVE] update: {name}")
         service.files().update(fileId=file_id, media_body=media).execute()
@@ -66,10 +60,7 @@ def main():
         print(f"[GDRIVE] 업로드할 HTML이 없음: {HTML_FILE}", file=sys.stderr)
         sys.exit(0)
 
-    # 파일명은 날짜 포함 (예: weekly_2025_08_18_2025_08_24.html)
-    # build_html_report.py 에서 같은 이름을 생성했다면 그대로 사용
     name = os.path.basename(HTML_FILE)
-
     try:
         svc = get_service()
         upload(svc, FOLDER_ID, HTML_FILE, name)
