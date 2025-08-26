@@ -40,34 +40,43 @@ jobs:
           mkdir -p "${DATA_DIR}"
           mkdir -p "${DIST_DIR}"
 
-      # (옵션) 구글 드라이브에서 일일 CSV 가져오기
+      # ---------------------------
+      # Google Drive에서 일일 CSV 가져오기 (옵션)
+      # -> if: 대신 쉘 가드로 비밀키 확인
+      # ---------------------------
       - name: Fetch daily CSVs from Google Drive (optional)
-        if: ${{ secrets.GDRIVE_FOLDER_ID != '' && secrets.GOOGLE_CLIENT_ID != '' && secrets.GOOGLE_CLIENT_SECRET != '' && secrets.GOOGLE_REFRESH_TOKEN != '' }}
         env:
           GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
           GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
           GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
           GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
         run: |
+          if [ -z "${GDRIVE_FOLDER_ID}" ] || [ -z "${GOOGLE_CLIENT_ID}" ] || [ -z "${GOOGLE_CLIENT_SECRET}" ] || [ -z "${GOOGLE_REFRESH_TOKEN}" ]; then
+            echo "[GDRIVE] secrets missing -> skip fetch"
+            exit 0
+          fi
           python scripts/fetch_from_gdrive.py || true
 
       - name: Quick scan (optional)
         run: |
-          echo "== data files =="
-          ls -l "${DATA_DIR}" || true
+          echo "== data files =="; ls -l "${DATA_DIR}" || true
 
       - name: Generate weekly report (per source)
         run: |
           python scripts/weekly_report_plus.py --src all --data-dir "${DATA_DIR}"
 
-      - name: Build Slack texts
-        run: python scripts/format_slack.py
-
+      # ---------------------------
+      # Slack 전송 (옵션) — 쉘 가드 사용
+      # ---------------------------
       - name: Send to Slack (optional)
-        if: ${{ secrets.SLACK_WEBHOOK_URL != '' }}
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: |
+          if [ -z "${SLACK_WEBHOOK_URL}" ]; then
+            echo "[SLACK] webhook not set -> skip"
+            exit 0
+          fi
+
           post() {
             local f="$1"
             if [ -f "$f" ]; then
@@ -77,6 +86,7 @@ jobs:
               echo "posted: $f"
             fi
           }
+
           post dist/slack_oy_kor.txt
           post dist/slack_oy_global.txt
           post dist/slack_amazon_us.txt
@@ -88,14 +98,20 @@ jobs:
           python scripts/build_html_report.py
           echo "== HTML files =="; ls -l dist
 
+      # ---------------------------
+      # Google Drive로 HTML 업로드 (옵션) — 쉘 가드 사용
+      # ---------------------------
       - name: Upload HTML to Google Drive (optional)
-        if: ${{ secrets.GDRIVE_FOLDER_ID != '' && secrets.GOOGLE_CLIENT_ID != '' && secrets.GOOGLE_CLIENT_SECRET != '' && secrets.GOOGLE_REFRESH_TOKEN != '' }}
         env:
           GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
           GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
           GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
           GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
         run: |
+          if [ -z "${GDRIVE_FOLDER_ID}" ] || [ -z "${GOOGLE_CLIENT_ID}" ] || [ -z "${GOOGLE_CLIENT_SECRET}" ] || [ -z "${GOOGLE_REFRESH_TOKEN}" ]; then
+            echo "[GDRIVE] secrets missing -> skip upload"
+            exit 0
+          fi
           python scripts/upload_to_gdrive.py
 
       - name: Upload artifact
